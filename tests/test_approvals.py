@@ -18,7 +18,8 @@ WORKER_ID = "approval-test-worker"
 
 
 class ApprovalWorker:
-    def __init__(self, environment="cloud-browser", computer_targets=None):
+    def __init__(self, environment="cloud-browser", computer_targets=None, safe_bash_path=True):
+        self.safe_bash_path = safe_bash_path
         self.calls = []
         self.environment = environment
         self.computer_targets = computer_targets
@@ -33,6 +34,8 @@ class ApprovalWorker:
             capabilities={"environment": self.environment, "desktop": not cloud, "bash": True,
                           "computer": True, "download": cloud, "upload": cloud, "actions": actions},
         )
+        if self.safe_bash_path:
+            connection.capabilities["safe_bash_path"] = True
         if self.computer_targets is not None:
             connection.capabilities["computer_targets"] = self.computer_targets
         if on_reserved is not None:
@@ -115,8 +118,8 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
 
     async def check_approvals(self, steps, pauses, *, mode="auto", environment="cloud-browser",
                               explicit_worker=False, trust_bash=False, automatic=(),
-                              computer_targets=None, routed_targets=None):
-        worker = ApprovalWorker(environment, computer_targets)
+                              computer_targets=None, routed_targets=None, safe_bash_path=True):
+        worker = ApprovalWorker(environment, computer_targets, safe_bash_path)
         expected_calls = [args.get("action") or args["command"] for _, args in steps]
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(data_dir=Path(directory), api_token=API_TOKEN, trust_cloud_bash=trust_bash)
@@ -187,12 +190,20 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
             ("computer_use", {"action": "scroll", "dy": 2}),
             ("computer_use", {"action": "click", "x": 8, "y": 7}),
             ("bash", {"command": "pwd"}),
-            ("bash", {"command": "ls"}),
+            ("bash", {"command": "ls -la ~/Documents/ ~/Desktop/ ~/Pictures/ 2>/dev/null"}),
+            ("bash", {"command": "find ~/Downloads -delete"}),
         ]
         for explicit_worker in (False, True):
             with self.subTest(explicit_worker=explicit_worker):
-                await self.check_approvals(steps, (2, 3, 5), environment="macos-desktop",
-                                           explicit_worker=explicit_worker, automatic=(0, 1, 4), trust_bash=True)
+                await self.check_approvals(steps, (2, 3, 6), environment="macos-desktop",
+                                           explicit_worker=explicit_worker, automatic=(0, 1, 4, 5), trust_bash=True)
+
+    async def test_old_worker_does_not_auto_approve_external_view_commands(self):
+        await self.check_approvals([
+            ("bash", {"command": "pwd"}),
+            ("bash", {"command": "ls -la ~/Documents/"}),
+            ("bash", {"command": "cat README.md"}),
+        ], pauses=(1, 2), environment="macos-desktop", safe_bash_path=False, automatic=(0,))
 
     async def test_desktop_worker_targets_the_current_desktop(self):
         await self.check_approvals([

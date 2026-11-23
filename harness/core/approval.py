@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from harness.core.approval_shell import is_safe_bash
+from harness.core.approval_shell import is_safe_bash, is_safe_bash_legacy
 from harness.storage.sqlite import ApprovalMode
 
 
@@ -25,12 +25,15 @@ def decide_approval(mode: ApprovalMode, tool: str, args: dict, capabilities: dic
     if tool == "bash":
         if not (cloud or desktop) or capabilities.get("bash") is not True:
             return ApprovalDecision(True, "此 Worker 的终端命令需要人工确认。")
-        # Desktop Bash inherits the user's PATH. Only allow Bash builtins there.
-        if is_safe_bash(args["command"], allow_ls=cloud):
+        # Old Workers retain the previous rule. New Workers isolate PATH and
+        # their shell environment, allowing additional read-only commands.
+        if is_safe_bash_legacy(args["command"], allow_ls=cloud):
             return ApprovalDecision(False, "匹配简单终端命令规则，不读取指定文件或执行 Shell 展开。")
+        if capabilities.get("safe_bash_path") is True and is_safe_bash(args["command"]):
+            return ApprovalDecision(False, "匹配只读终端命令规则。")
         if cloud and trust_cloud_bash:
             return ApprovalDecision(False, "服务端配置了信任此类浏览器 Worker 的终端命令。")
-        return ApprovalDecision(True, "命令超出简单终端命令规则，需要人工确认。")
+        return ApprovalDecision(True, "命令未匹配自动放行的只读规则，需要人工确认。")
 
     action = args["action"]
     target = args.get("target", "browser" if cloud else "desktop")

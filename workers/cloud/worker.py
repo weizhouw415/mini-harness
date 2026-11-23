@@ -6,6 +6,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from harness.core.approval_shell import is_safe_bash
 from workers.common.browser import BROWSER_ACTIONS, BrowserController, BrowserSession
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
@@ -33,6 +34,7 @@ class WorkerBackend:
     def capabilities(self) -> dict:
         return {
             "environment": "cloud-browser", "desktop": False, "bash": True,
+            "safe_bash_path": True,
             "computer": True, "download": True, "upload": True, "actions": list(BROWSER_ACTIONS),
             "computer_targets": {"browser": list(BROWSER_ACTIONS)},
         }
@@ -57,8 +59,11 @@ class WorkerBackend:
         async with run.lock:
             if run.closed:
                 raise ValueError("Run is closed")
+            safe = is_safe_bash(command)
+            if safe:
+                command = "PATH=/usr/bin:/bin\n" + command
             return await run_shell(
-                ["/bin/bash", "--noprofile", "--norc", "-c", command],
+                ["/bin/bash", "--noprofile", "--norc", *(["-p"] if safe else []), "-c", command],
                 cwd=run.path, timeout=timeout,
                 environment={
                     "PATH": "/usr/local/bin:/usr/bin:/bin",

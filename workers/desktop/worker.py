@@ -10,6 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from harness.core.approval_shell import is_safe_bash
 from harness.execution.protocol import MAX_IMAGE_BYTES
 from workers.common.actions import integer_field, text_field
 from workers.common.config import env_flag
@@ -52,6 +53,7 @@ class WorkerBackend:
         actions = list(ACTIONS) if self.desktop_enabled else []
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
+            "safe_bash_path": True,
             "computer": self.desktop_enabled, "download": False, "upload": False,
             "actions": actions, "computer_targets": {"desktop": actions},
         }
@@ -191,8 +193,15 @@ class WorkerBackend:
 
     async def _bash_arguments(self, path: Path, command: str) -> list[str]:
         configured_path = os.getenv("MINI_DESKTOP_BASH_PATH")
+        # Commands eligible for automatic approval must resolve external tools
+        # from the system rather than from the user's PATH. Privileged mode also
+        # ignores Bash startup hooks and imported shell functions (notably in WSL).
+        safe = is_safe_bash(command)
+        if safe:
+            command = "PATH=/usr/bin:/bin\n" + command
+        options = ["--noprofile", "--norc"] + (["-p"] if safe else []) + ["-c", command]
         if sys.platform != "win32":
-            return [configured_path or "/bin/bash", "--noprofile", "--norc", "-c", command]
+            return [configured_path or "/bin/bash", *options]
         kind = os.getenv("MINI_DESKTOP_BASH_KIND", "git-bash")
         if kind == "git-bash":
             candidates = [
@@ -202,7 +211,7 @@ class WorkerBackend:
             executable = configured_path or next((str(path) for path in candidates if path.is_file()), None)
             if not executable:
                 raise RuntimeError("Git Bash was not found. Set MINI_DESKTOP_BASH_PATH or use WSL")
-            return [executable, "--noprofile", "--norc", "-c", command]
+            return [executable, *options]
         if kind == "wsl":
             executable = configured_path or "wsl.exe"
             conversion = await run_shell(
@@ -212,7 +221,7 @@ class WorkerBackend:
             linux_path = conversion["stdout"].strip()
             if conversion["exit_code"] != 0 or not linux_path.startswith("/"):
                 raise RuntimeError("WSL could not convert the run workspace path")
-            return [executable, "--cd", linux_path, "--exec", "bash", "--noprofile", "--norc", "-c", command]
+            return [executable, "--cd", linux_path, "--exec", "/bin/bash", *options]
         raise ValueError("MINI_DESKTOP_BASH_KIND must be git-bash or wsl")
 
     @staticmethod

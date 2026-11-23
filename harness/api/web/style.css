@@ -700,6 +700,61 @@ dialog input:not([type="checkbox"]) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --canvas: #17161f;
+    --surface: #211f2b;
+    --side: #1b1a24;
+    --ink: #efedf8;
+    --muted: #aaa7bb;
+    --line: #393646;
+    --accent: #b8aaff;
+    --accent-hover: #d0c7ff;
+    --soft: #34304f;
+    --danger: #f49bad;
+    --success: #8bd5b3;
+    --warning: #e7bd7b;
+  }
+
+  .new { border-color: #484063; background: #282539; }
+  .new:hover { border-color: #7666b4; }
+  #history button, #settings { color: #c2bfd1; }
+  #history button:hover, #settings:hover { background: #302d3d; }
+  #history button[aria-current="true"] { border-color: #514875; color: #d5cdff; }
+  #status { background: #34313f; color: #cbc8d8; }
+  #status[data-state="completed"] { background: #203b31; }
+  #status[data-state="failed"], .turn-status[data-state="failed"] { background: #492731; }
+  #status:is([data-state="paused"], [data-state="awaiting_approval"], [data-state="approving"]) { background: #483821; }
+  #scroll { scrollbar-color: #565166 transparent; }
+  .hero-mark { box-shadow: 0 0 0 8px var(--soft), 0 10px 24px #0006; }
+  .empty button { color: #d0cae7; border-color: #494258; }
+  .empty button:hover { border-color: #7666b4; }
+  .turn::before, .turn > .task { border-color: #514875; }
+  .turn > .task { color: #ece8ff; }
+  .turn-status { background: #302d3b; }
+  .turn-progress { border-color: #4a4264; background: #302a43; color: #ddd4ff; }
+  .activity-indicator { background: #443b60; }
+  .turn-progress[data-state="paused"] { background: #3e3323; border-color: #605035; }
+  .turn-progress[data-state="paused"] .activity-indicator { background: #57452b; }
+  .approval { border-color: #655235; background: #342b20; }
+  .approval-icon { background: #51412a; }
+  .approval-heading p, #approval-reason { color: #d5c3a5; }
+  .approval pre { background: #433625; }
+  .run-actions [data-action="cancel"]:hover { border-color: #74434f; background: #492731; }
+  #composer { border-color: var(--line); box-shadow: 0 7px 27px #0003; }
+  #composer:focus-within { border-color: #8b7bcf; box-shadow: 0 0 0 3px #8b7bcf40, 0 7px 27px #0003; }
+  #task::placeholder { color: #aaa7bb; }
+  .select-control { color: #cbc8da; }
+  .options select { background: #292632; }
+  .options select:hover { border-color: #756b91; background: #34303f; }
+  .primary, .send { background: #6752c9; color: #fff; }
+  .primary:not(:disabled):hover, .send:not(:disabled):hover { background: #7965da; }
+  #notice { border-color: #74434f; background: #492731; }
+  dialog { box-shadow: 0 18px 70px #0009; }
+  dialog::backdrop { background: #0009; }
+}
+
 /* Execution trace */
 .trace {
   min-width: 0;
@@ -947,4 +1002,29 @@ dialog input:not([type="checkbox"]) {
   .trace-step-summary, .trace-entry { padding-inline: 5px; gap: 7px; }
   .trace-timeline > :not(:last-child)::before { inset-inline-start: 17px; }
   .trace-step-detail { margin-inline: 38px 5px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  .trace-status, .trace-step-state {
+    --trace-state-bg: #302e3d;
+    --trace-state-text: #c8c5d6;
+  }
+
+  .trace[data-state="completed"] .trace-status,
+  .trace-step-state[data-tone="success"] {
+    --trace-state-bg: #193d31;
+    --trace-state-text: #9bdfbe;
+  }
+
+  .trace[data-state="awaiting_approval"] .trace-status,
+  .trace[data-state="paused"] .trace-status,
+  .trace-step-state[data-tone="warning"] {
+    --trace-state-bg: #49371e;
+    --trace-state-text: #f1cc88;
+  }
+
+  .trace[data-state="failed"] .trace-status,
+  .trace-step-state[data-tone="error"] {
+    --trace-state-bg: #492734;
+  }
 }
