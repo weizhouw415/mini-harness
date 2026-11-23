@@ -1,0 +1,264 @@
+import asyncio
+import contextlib
+import ctypes
+import io
+import os
+import shutil
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from harness.execution.protocol import MAX_IMAGE_BYTES
+from workers.common.actions import integer_field, text_field
+from workers.common.config import env_flag
+from workers.common.shell import run_shell
+
+
+ACTIONS = ("screenshot", "observe", "click", "type", "scroll", "press")
+KEY_ALIASES = {
+    "alt": "alt", "arrowdown": "down", "arrowleft": "left", "arrowright": "right", "arrowup": "up",
+    "backspace": "backspace", "control": "ctrl", "delete": "delete", "enter": "enter", "escape": "esc",
+    "meta": "command" if sys.platform == "darwin" else "win", "pagedown": "pagedown", "pageup": "pageup",
+    "shift": "shift", "space": "space", "tab": "tab",
+}
+
+
+@dataclass
+class Run:
+    path: Path
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    closed: bool = False
+
+
+class WorkerBackend:
+    def __init__(self, workspace_root: Path | None = None):
+        self.workspace_root = Path(
+            workspace_root or os.getenv("MINI_WORKER_WORKSPACE_ROOT") or Path.home() / ".mini-harness" / "workspaces"
+        ).expanduser().resolve()
+        self.pause_file = Path(os.getenv("MINI_DESKTOP_PAUSE_FILE") or self.workspace_root / ".paused").expanduser().resolve()
+        self.desktop_enabled = env_flag("MINI_DESKTOP_CONTROL")
+        self.bash_enabled = env_flag("MINI_DESKTOP_BASH")
+        self._runs: dict[str, Run] = {}
+        self._gui = None
+        self._gui_lock = threading.Lock()
+
+    @property
+    def environment(self) -> str:
+        return {"darwin": "macos-desktop", "win32": "windows-desktop"}.get(sys.platform, "unsupported-desktop")
+
+    def capabilities(self) -> dict:
+        return {
+            "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
+            "computer": self.desktop_enabled, "download": False, "upload": False,
+            "actions": list(ACTIONS) if self.desktop_enabled else [],
+        }
+
+    def pause(self) -> None:
+        self.pause_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.pause_file.touch(mode=0o600)
+
+    def resume(self) -> None:
+        self.pause_file.unlink(missing_ok=True)
+
+    def check_available(self) -> None:
+        if self.environment == "unsupported-desktop":
+            raise RuntimeError("The desktop worker supports macOS and Windows")
+        if not self.desktop_enabled:
+            raise PermissionError("Set MINI_DESKTOP_CONTROL=1 on the desktop to authorize local control")
+        if self.pause_file.exists():
+            raise PermissionError("Desktop worker is paused. Resume it locally before continuing")
+
+    async def open_run(self, run_id: str, workspace_id: str) -> None:
+        self.check_available()
+        if run_id in self._runs and not self._runs[run_id].closed:
+            return
+        if self._runs:
+            raise RuntimeError("This desktop worker already has an active run")
+        self.workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._runs[run_id] = Run(Path(tempfile.mkdtemp(prefix="run-", dir=self.workspace_root)))
+
+    def _get_run(self, run_id: str) -> Run:
+        try:
+            return self._runs[run_id]
+        except KeyError:
+            raise ValueError("Unknown run") from None
+
+    def _get_gui(self):
+        if self._gui is None:
+            import pyautogui
+
+            pyautogui.FAILSAFE = True
+            self._gui = pyautogui
+        return self._gui
+
+    @staticmethod
+    def _point(gui, action: dict) -> tuple[int, int]:
+        x, y = integer_field(action, "x"), integer_field(action, "y")
+        if not gui.onScreen(x, y):
+            raise ValueError("Coordinates are outside the primary screen")
+        return x, y
+
+    @staticmethod
+    def _screenshot(gui) -> dict:
+        image = gui.screenshot()
+        width, height = gui.size()
+        if image.size != (width, height):
+            image = image.resize((width, height))
+        for format_name, options in (("PNG", {}), ("JPEG", {"quality": 65})):
+            candidate = image if format_name == "PNG" else image.convert("RGB")
+            with io.BytesIO() as output:
+                candidate.save(output, format_name, **options)
+                if output.tell() <= MAX_IMAGE_BYTES:
+                    return {
+                        "image": output.getvalue(), "mime_type": f"image/{format_name.lower()}",
+                        "width": width, "height": height,
+                    }
+        raise ValueError("Desktop screenshot exceeds the image size limit")
+
+    @staticmethod
+    def _press(gui, raw_key: str) -> None:
+        keys = [raw_key] if raw_key == "+" else raw_key.split("+")
+        normalized = []
+        for key in keys:
+            lowered = key.strip().lower()
+            if lowered == "controlormeta":
+                lowered = "meta" if sys.platform == "darwin" else "control"
+            normalized.append(KEY_ALIASES.get(lowered, lowered))
+        if not normalized or any(key not in gui.KEYBOARD_KEYS for key in normalized):
+            raise ValueError("Unsupported desktop keyboard key or shortcut")
+        if len(normalized) == 1:
+            gui.press(normalized[0])
+        else:
+            gui.hotkey(*normalized)
+
+    def _computer(self, run: Run, name: str, action: dict) -> dict:
+        with self._gui_lock:
+            self.check_available()
+            if run.closed:
+                raise ValueError("Run is closed")
+            gui = self._get_gui()
+            try:
+                gui.failSafeCheck()
+                if name in {"screenshot", "observe"}:
+                    return self._screenshot(gui)
+                if name == "click":
+                    gui.click(*self._point(gui, action))
+                elif name == "type":
+                    value = text_field(action, "text", allow_empty=True, limit=4096)
+                    if any(not (32 <= ord(char) < 127 or char in "\n\t") for char in value):
+                        raise ValueError("Desktop typing supports ASCII text, newlines, and tabs")
+                    for start in range(0, len(value), 64):
+                        self.check_available()
+                        if run.closed:
+                            raise ValueError("Run is closed")
+                        gui.write(value[start:start + 64])
+                elif name == "scroll":
+                    if "x" in action or "y" in action:
+                        gui.moveTo(*self._point(gui, action))
+                    dx, dy = integer_field(action, "dx", default=0), integer_field(action, "dy", default=0)
+                    if dx and sys.platform == "win32":
+                        ctypes.windll.user32.mouse_event(0x01000, 0, 0, dx * 120, 0)
+                    elif dx:
+                        gui.hscroll(dx)
+                    if dy:
+                        gui.scroll(-dy)
+                elif name == "press":
+                    self._press(gui, text_field(action, "key", limit=80))
+            except gui.FailSafeException as exc:
+                self.pause()
+                raise PermissionError("Desktop worker paused by the mouse-corner fail-safe") from exc
+            return {"ok": True}
+
+    async def computer(self, run_id: str, action: dict) -> dict:
+        name = text_field(action, "action", limit=40)
+        if name not in ACTIONS:
+            raise ValueError(f"Unsupported desktop action: {name}")
+        run = self._get_run(run_id)
+        async with run.lock:
+            task = asyncio.create_task(asyncio.to_thread(self._computer, run, name, action))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                run.closed = True
+                with contextlib.suppress(Exception):
+                    await task
+                raise
+
+    async def _bash_arguments(self, path: Path, command: str) -> list[str]:
+        configured_path = os.getenv("MINI_DESKTOP_BASH_PATH")
+        if sys.platform != "win32":
+            return [configured_path or "/bin/bash", "--noprofile", "--norc", "-c", command]
+        kind = os.getenv("MINI_DESKTOP_BASH_KIND", "git-bash")
+        if kind == "git-bash":
+            candidates = [
+                Path(os.environ[key]) / "Git" / "bin" / "bash.exe"
+                for key in ("ProgramFiles", "ProgramFiles(x86)") if key in os.environ
+            ]
+            executable = configured_path or next((str(path) for path in candidates if path.is_file()), None)
+            if not executable:
+                raise RuntimeError("Git Bash was not found. Set MINI_DESKTOP_BASH_PATH or use WSL")
+            return [executable, "--noprofile", "--norc", "-c", command]
+        if kind == "wsl":
+            executable = configured_path or "wsl.exe"
+            conversion = await run_shell(
+                [executable, "--exec", "wslpath", "-a", "-u", str(path)],
+                cwd=path, environment=self._bash_environment(), timeout=10,
+            )
+            linux_path = conversion["stdout"].strip()
+            if conversion["exit_code"] != 0 or not linux_path.startswith("/"):
+                raise RuntimeError("WSL could not convert the run workspace path")
+            return [executable, "--cd", linux_path, "--exec", "bash", "--noprofile", "--norc", "-c", command]
+        raise ValueError("MINI_DESKTOP_BASH_KIND must be git-bash or wsl")
+
+    @staticmethod
+    def _bash_environment() -> dict[str, str]:
+        names = {
+            "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "PROGRAMFILES", "PROGRAMFILES(X86)",
+            "TMP", "TEMP", "LANG", "TERM", "LOCALAPPDATA", "APPDATA",
+        }
+        return {name: value for name, value in os.environ.items() if name.upper() in names}
+
+    async def _watch_pause(self) -> None:
+        while not self.pause_file.exists():
+            await asyncio.sleep(0.2)
+
+    async def bash(self, run_id: str, command: str, timeout: float) -> dict:
+        if not self.bash_enabled:
+            raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
+        run = self._get_run(run_id)
+        async with run.lock:
+            self.check_available()
+            if run.closed:
+                raise ValueError("Run is closed")
+            arguments = await self._bash_arguments(run.path, command)
+            self.check_available()
+            shell = asyncio.create_task(run_shell(
+                arguments, cwd=run.path, environment=self._bash_environment(), timeout=timeout,
+            ))
+            pause = asyncio.create_task(self._watch_pause())
+            try:
+                completed, _ = await asyncio.wait({shell, pause}, return_when=asyncio.FIRST_COMPLETED)
+                if pause in completed:
+                    raise PermissionError("Desktop worker was paused while Bash was running")
+                return shell.result()
+            finally:
+                for task in (shell, pause):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(shell, pause, return_exceptions=True)
+
+    async def close_run(self, run_id: str) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        run.closed = True
+        async with run.lock:
+            with contextlib.suppress(FileNotFoundError):
+                await asyncio.to_thread(shutil.rmtree, run.path)
+            self._runs.pop(run_id, None)
+
+    async def close(self) -> None:
+        for run_id in list(self._runs):
+            await self.close_run(run_id)

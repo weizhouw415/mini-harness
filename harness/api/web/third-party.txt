@@ -1,0 +1,13 @@
+Browser dependencies
+
+marked.umd.js
+  Marked 18.0.11, MIT
+  https://github.com/markedjs/marked
+  Unmodified lib/marked.umd.js from the marked npm package.
+  License: marked-LICENSE.txt
+
+purify.min.js
+  DOMPurify 3.4.16, Apache-2.0 OR MPL-2.0
+  https://github.com/cure53/DOMPurify
+  Unmodified dist/purify.min.js from the dompurify npm package.
+  Licenses: dompurify-LICENSE.txt, dompurify-LICENSE-MPL.txt

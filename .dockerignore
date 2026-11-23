@@ -1,0 +1,11 @@
+.git
+.venv
+.harness
+.worker
+.env
+__pycache__
+**/__pycache__
+.pytest_cache
+*.egg-info
+build
+dist

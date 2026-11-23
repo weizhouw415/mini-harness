@@ -1,0 +1,48 @@
+.markdown {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown :is(p, ul, ol, pre, blockquote, table, hr) { margin: .8em 0; }
+.markdown :is(h1, h2, h3, h4, h5, h6) { margin: 1.15em 0 .45em; line-height: 1.3; }
+.markdown h1 { font-size: 1.55em; }
+.markdown h2 { font-size: 1.3em; }
+.markdown h3 { font-size: 1.15em; }
+.markdown :is(h4, h5, h6) { font-size: 1em; }
+.markdown :is(ul, ol) { padding-inline-start: 1.5em; }
+.markdown li > :is(p, ul, ol) { margin-block: .3em; }
+.markdown a { color: var(--accent); text-underline-offset: .18em; }
+.markdown blockquote {
+  border-inline-start: 3px solid var(--line);
+  padding-inline-start: 1em;
+  color: var(--muted);
+}
+.markdown code { font: .92em/1.5 ui-monospace, monospace; }
+.markdown :not(pre) > code {
+  background: var(--soft);
+  border-radius: 4px;
+  padding: .12em .32em;
+  white-space: break-spaces;
+}
+.markdown pre {
+  background: var(--side);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: none;
+  overflow: auto;
+  padding: 10px 12px;
+  white-space: pre;
+  overflow-wrap: normal;
+  font-size: .94em;
+}
+.markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.markdown :is(th, td) { border: 1px solid var(--line); padding: .35em .6em; }
+.markdown th { background: var(--side); }
+.markdown hr { border: 0; border-top: 1px solid var(--line); }

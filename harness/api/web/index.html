@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mini Harness</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <link rel="stylesheet" href="/ui/markdown.css">
+  <script src="/ui/marked.umd.js" defer></script>
+  <script src="/ui/purify.min.js" defer></script>
+  <script src="/ui/markdown.js" defer></script>
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <aside id="sidebar" aria-label="对话侧栏">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true">⌘</span> Mini Harness</a>
+    <button class="new" id="new" type="button">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      新建对话
+    </button>
+    <div class="history-label" id="history-label">最近对话</div>
+    <nav id="history" aria-labelledby="history-label"></nav>
+    <footer class="sidebar-footer">
+      <span id="connection"><i></i> 未连接</span>
+      <button id="settings" type="button">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><path d="M9 4v4m6 2v4m-6 2v4"/></svg>
+        模型设置
+      </button>
+    </footer>
+  </aside>
+  <div id="sidebar-scrim" aria-hidden="true" hidden></div>
+  <main>
+    <header class="conversation-header">
+      <div class="conversation-heading">
+        <button id="menu" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="对话列表">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M9 5v14"/></svg>
+        </button>
+        <svg class="icon conversation-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.6-3.6A7.5 7.5 0 1 1 20 11.5Z"/></svg>
+        <strong id="title">新对话</strong>
+      </div>
+      <span id="status" role="status"></span>
+    </header>
+    <div id="notice" role="alert" hidden></div>
+    <section id="scroll" aria-label="任务与运行轨迹" tabindex="0">
+      <div id="empty" class="empty">
+        <span class="mark hero-mark" aria-hidden="true">⌘</span>
+        <h1>今天想完成什么？</h1>
+        <p>描述你的任务，Mini Harness 会在选定的 Worker 上执行。</p>
+        <button id="example" type="button">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 9.5h17M7 7.25h.01m3 0h.01"/></svg>
+          打开 example.com，截图并告诉我页面标题
+          <svg class="icon example-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6M8 6h10v10"/></svg>
+        </button>
+      </div>
+      <div id="conversation-loading" class="turn-progress" data-state="loading" role="status" hidden>
+        <span class="activity-indicator" aria-hidden="true"><span></span><span></span><span></span></span>
+        <div class="activity-copy"><strong class="activity-title">正在读取对话</strong></div>
+      </div>
+      <div id="run" hidden>
+        <div id="turns"></div>
+        <section class="approval" id="approval" aria-labelledby="approval-title" hidden>
+          <div class="approval-heading">
+            <span class="approval-icon" aria-hidden="true">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 22s7-3.5 7-10V5l-7-3-7 3v7c0 6.5 7 10 7 10Z"/><path d="M12 8v4m0 3h.01"/></svg>
+            </span>
+            <div><h2 id="approval-title">等待你审批</h2><p id="approval-tool"></p></div>
+          </div>
+          <pre id="approval-detail"></pre>
+          <div class="approval-buttons">
+            <button data-action="deny" type="button">拒绝</button>
+            <button class="primary" data-action="allow" type="button">允许本次操作</button>
+          </div>
+        </section>
+        <div class="run-actions">
+          <button data-action="resume" type="button" hidden>恢复运行</button>
+          <button data-action="cancel" type="button" hidden>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            <span>取消运行</span>
+          </button>
+        </div>
+      </div>
+    </section>
+    <div class="jump-area">
+      <button id="jump-latest" type="button" hidden>
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m-5-5 5 5 5-5"/></svg>
+        回到最新
+      </button>
+    </div>
+    <form id="composer">
+      <textarea id="task" rows="2" maxlength="16000" placeholder="描述你想完成的任务…" aria-label="任务描述" aria-describedby="typing-hint" required></textarea>
+      <div class="composer-bar">
+        <div class="options">
+          <label class="select-control">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+            <select id="worker" aria-label="选择 Worker"><option value="">自动选择 Worker</option></select>
+          </label>
+          <label class="select-control">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s7-3.5 7-10V5l-7-3-7 3v7c0 6.5 7 10 7 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+            <select id="approval-mode" aria-label="审批模式" aria-describedby="approval-hint">
+              <option value="manual">完全手动</option>
+              <option value="auto" selected>自动审批</option>
+              <option value="allow">完全允许</option>
+            </select>
+          </label>
+        </div>
+        <button class="send" id="send" type="submit" aria-label="发送消息">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>
+        </button>
+      </div>
+      <div class="composer-hints"><span id="approval-hint"></span><span id="typing-hint"><kbd>Enter</kbd> 发送 <span class="hint-separator">·</span> <kbd>Shift+Enter</kbd> 换行</span></div>
+    </form>
+  </main>
+  <dialog id="model-dialog" aria-labelledby="model-dialog-title">
+    <form id="model-form">
+      <h2 id="model-dialog-title">模型设置</h2>
+      <label for="base-url">Base URL</label>
+      <input id="base-url" type="url" required maxlength="2048" placeholder="https://api.example.com/v1">
+      <label for="api-key">API Key</label>
+      <input id="api-key" type="password" autocomplete="off" maxlength="8192" aria-describedby="key-hint">
+      <p id="key-hint"></p>
+      <label id="clear-key-label" hidden><input id="clear-key" type="checkbox"> 清除已保存的 API Key</label>
+      <label for="model-name">模型名</label>
+      <input id="model-name" required maxlength="256" placeholder="模型 ID">
+      <div class="dialog-actions">
+        <button id="close-settings" type="button">关闭</button>
+        <button class="primary" type="submit">保存</button>
+      </div>
+      <p id="model-error" role="alert" hidden></p>
+    </form>
+  </dialog>
+</body>
+</html>

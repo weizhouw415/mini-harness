@@ -1,0 +1,49 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+    environment:
+      HARNESS_API_TOKEN: ${HARNESS_API_TOKEN:?Set HARNESS_API_TOKEN}
+      HARNESS_WORKER_SECRET: ${HARNESS_WORKER_SECRET:?Set HARNESS_WORKER_SECRET}
+      HARNESS_MODEL: ${HARNESS_MODEL:?Set HARNESS_MODEL}
+      HARNESS_LLM_BASE_URL: ${HARNESS_LLM_BASE_URL:-https://api.openai.com/v1}
+      HARNESS_LLM_API_KEY: ${HARNESS_LLM_API_KEY:-}
+      HARNESS_TRUST_CLOUD_BASH: ${HARNESS_TRUST_CLOUD_BASH:-0}
+    ports:
+      - "127.0.0.1:${HARNESS_PORT:-8000}:8000"
+    volumes:
+      - data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  cloud-worker:
+    build:
+      context: .
+      dockerfile: workers/cloud/Dockerfile
+    init: true
+    depends_on:
+      - server
+    environment:
+      MINI_WORKER_URL: ws://server:8000/v1/workers/ws
+      MINI_WORKER_ALLOW_INSECURE: "1"
+      MINI_WORKER_ID: cloud
+      MINI_WORKER_SECRET: ${HARNESS_WORKER_SECRET:?Set HARNESS_WORKER_SECRET}
+      NO_PROXY: "server,localhost,127.0.0.1,${NO_PROXY:-}"
+      no_proxy: "server,localhost,127.0.0.1,${NO_PROXY:-}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    shm_size: 256mb
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  data:
