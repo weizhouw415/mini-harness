@@ -16,7 +16,7 @@ class Settings:
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     trust_cloud_bash: bool = False
-    max_steps: int = 100
+    max_steps: int = 500
     context_chars: int = 48_000
     max_tool_seconds: int = 120
 
@@ -40,7 +40,7 @@ class Settings:
             llm_base_url=os.environ.get("HARNESS_LLM_BASE_URL", "https://api.openai.com/v1"),
             llm_api_key=os.environ.get("HARNESS_LLM_API_KEY", ""),
             trust_cloud_bash=os.environ.get("HARNESS_TRUST_CLOUD_BASH") == "1",
-            max_steps=int(os.environ.get("HARNESS_MAX_STEPS", "100")),
+            max_steps=int(os.environ.get("HARNESS_MAX_STEPS", "500")),
             context_chars=int(os.environ.get("HARNESS_CONTEXT_CHARS", "48000")),
             max_tool_seconds=int(os.environ.get("HARNESS_MAX_TOOL_SECONDS", "120")),
         )
