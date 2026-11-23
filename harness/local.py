@@ -28,7 +28,7 @@ def main(*, headless: bool = False):
     if config.exists():
         for line in config.read_text(encoding="utf-8").splitlines():
             key, separator, value = line.partition("=")
-            if separator and key in {"HARNESS_API_TOKEN", "HARNESS_WORKER_SECRET"}:
+            if separator and key in {"HARNESS_API_TOKEN", "HARNESS_WORKER_SECRET", "MINI_DESKTOP_BASH"}:
                 env.setdefault(key, value)
     if not env.get("HARNESS_API_TOKEN") or not env.get("HARNESS_WORKER_SECRET"):
         raise SystemExit("Set HARNESS_API_TOKEN and HARNESS_WORKER_SECRET, or add them to .harness/local.env.")
