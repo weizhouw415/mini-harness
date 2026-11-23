@@ -1,4 +1,4 @@
-"""Start the local server and its desktop or headless browser worker."""
+"""Start the local server and its desktop and cloud browser workers."""
 from __future__ import annotations
 
 import os
@@ -6,8 +6,20 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+
+def _chrome_executable(env: dict[str, str]) -> str | None:
+    if sys.platform == "darwin":
+        candidates = [Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")]
+    elif sys.platform == "win32":
+        candidates = [Path(env[key]) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                      for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA") if env.get(key)]
+    else:
+        candidates = []
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def main(*, headless: bool = False):
@@ -29,16 +41,17 @@ def main(*, headless: bool = False):
             raise SystemExit("Port 8000 is unavailable. Stop the existing local server first.") from error
 
     desktop = not headless and sys.platform in {"darwin", "win32"}
-    worker = "desktop" if desktop else "cloud"
     worker_env = env.copy()
-    worker_env["MINI_WORKER_SECRET"] = env["HARNESS_WORKER_SECRET"]
-    worker_env["MINI_WORKER_ID"] = worker
+    worker_env["MINI_WORKER_SECRET"] = worker_env.pop("HARNESS_WORKER_SECRET")
+    worker_env.pop("HARNESS_API_TOKEN", None)
+    browser_env = {**worker_env, "MINI_WORKER_ID": "cloud"}
+    if not browser_env.get("MINI_CLOUD_BROWSER_EXECUTABLE"):
+        if chrome := _chrome_executable(browser_env):
+            browser_env["MINI_CLOUD_BROWSER_EXECUTABLE"] = chrome
     if desktop:
-        worker_env["MINI_DESKTOP_CONTROL"] = "1"
-    elif sys.platform == "darwin" and not worker_env.get("MINI_CLOUD_BROWSER_EXECUTABLE"):
-        chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-        if chrome.is_file():
-            worker_env["MINI_CLOUD_BROWSER_EXECUTABLE"] = str(chrome)
+        browser_env.setdefault("MINI_CLOUD_CHROMIUM_SANDBOX", "1")
+    if sys.platform == "win32":
+        browser_env.setdefault("MINI_WORKER_WORKSPACE_ROOT", str(Path(tempfile.gettempdir()) / "mini-harness-worker"))
 
     children = []
     stopping = False
@@ -55,7 +68,10 @@ def main(*, headless: bool = False):
 
     try:
         children.append(subprocess.Popen([sys.executable, "-m", "harness.cli", "serve"], env=env))
-        children.append(subprocess.Popen([sys.executable, "-m", f"workers.{worker}"], env=worker_env))
+        if desktop:
+            desktop_env = {**worker_env, "MINI_WORKER_ID": "desktop", "MINI_DESKTOP_CONTROL": "1"}
+            children.append(subprocess.Popen([sys.executable, "-m", "workers.desktop"], env=desktop_env))
+        children.append(subprocess.Popen([sys.executable, "-m", "workers.cloud"], env=browser_env))
         print("Mini Harness is starting at http://127.0.0.1:8000/ (Ctrl+C to stop)", flush=True)
         while not stopping:
             for child in children:

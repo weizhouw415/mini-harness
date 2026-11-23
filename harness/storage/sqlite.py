@@ -201,6 +201,27 @@ class RunStore:
                 self._append(db, run_id, *event)
             self._append(db, run_id, "status", {"status": status, "error": error})
 
+    def update_approval_mode(self, run_id: str, mode: ApprovalMode) -> tuple[dict, bool]:
+        requeued = False
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status, approval_mode, approval FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise NotFound("Run not found.")
+            if row["status"] not in {"queued", "running", "paused", "awaiting_approval"}:
+                raise Conflict("Approval mode can only be changed on an unfinished run.")
+            if row["approval_mode"] != mode:
+                requeued = row["status"] == "awaiting_approval"
+                db.execute(
+                    "UPDATE runs SET approval_mode = ?, status = ?, approval = ?, updated_at = ? WHERE id = ?",
+                    (mode, "queued" if requeued else row["status"], None if requeued else row["approval"], now(), run_id),
+                )
+                self._append(db, run_id, "approval_mode_changed", {"previous_mode": row["approval_mode"],
+                                                                   "approval_mode": mode})
+                if requeued:
+                    self._append(db, run_id, "status", {"status": "queued", "error": None})
+        return self.get(run_id), requeued
+
     def recover_interrupted(self):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

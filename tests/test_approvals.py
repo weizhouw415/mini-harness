@@ -8,6 +8,7 @@ import httpx
 
 from harness.api.server import create_app
 from harness.config import Settings
+from harness.core.agent import Agent
 from harness.storage.sqlite import RunStore
 from tests.harness_support import tool_call, wait_for_run
 
@@ -17,9 +18,10 @@ WORKER_ID = "approval-test-worker"
 
 
 class ApprovalWorker:
-    def __init__(self, environment="cloud-browser"):
+    def __init__(self, environment="cloud-browser", computer_targets=None):
         self.calls = []
         self.environment = environment
+        self.computer_targets = computer_targets
 
     async def acquire(self, worker_id, run_id, workspace_id, *, on_reserved=None):
         cloud = self.environment == "cloud-browser"
@@ -31,6 +33,8 @@ class ApprovalWorker:
             capabilities={"environment": self.environment, "desktop": not cloud, "bash": True,
                           "computer": True, "download": cloud, "upload": cloud, "actions": actions},
         )
+        if self.computer_targets is not None:
+            connection.capabilities["computer_targets"] = self.computer_targets
         if on_reserved is not None:
             on_reserved(connection)
         return connection
@@ -110,8 +114,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(model.results[1]["exit_code"], 0)
 
     async def check_approvals(self, steps, pauses, *, mode="auto", environment="cloud-browser",
-                              explicit_worker=False, trust_bash=False, automatic=()):
-        worker = ApprovalWorker(environment)
+                              explicit_worker=False, trust_bash=False, automatic=(),
+                              computer_targets=None, routed_targets=None):
+        worker = ApprovalWorker(environment, computer_targets)
         expected_calls = [args.get("action") or args["command"] for _, args in steps]
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(data_dir=Path(directory), api_token=API_TOKEN, trust_cloud_bash=trust_bash)
@@ -136,6 +141,8 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
                     tool, args = steps[index]
                     self.assertEqual(approval["tool"], tool)
                     self.assertEqual({key: approval["arguments"][key] for key in args}, args)
+                    if routed_targets is not None:
+                        self.assertEqual(approval["arguments"].get("target"), routed_targets[index])
                     self.assertEqual([action for _, action in worker.calls], expected_calls[:index])
                     if mode == "auto":
                         self.assertIsInstance(approval["reason"], str)
@@ -151,6 +158,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
 
                 events = (await client.get(f"/v1/runs/{run_id}/events")).raise_for_status().json()
                 self.assertEqual([event["data"] for event in events if event["type"] == "approval_requested"], requested)
+                if routed_targets is not None:
+                    self.assertEqual([event["data"]["arguments"].get("target") for event in events
+                                      if event["type"] == "tool_call"], routed_targets)
                 auto_calls = {event["data"]["call_id"]: event["data"]["auto_approval_reason"] for event in events
                               if event["type"] == "tool_call" and "auto_approval_reason" in event["data"]}
                 self.assertEqual(list(auto_calls), [worker.calls[index][0] for index in automatic])
@@ -183,6 +193,18 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(explicit_worker=explicit_worker):
                 await self.check_approvals(steps, (2, 3, 5), environment="macos-desktop",
                                            explicit_worker=explicit_worker, automatic=(0, 1, 4), trust_bash=True)
+
+    async def test_desktop_worker_targets_the_current_desktop(self):
+        await self.check_approvals([
+            ("computer_use", {"action": "observe"}),
+            ("computer_use", {"action": "click", "x": 8, "y": 7}),
+        ], pauses=(1,), automatic=(0,), environment="macos-desktop",
+            computer_targets={"desktop": ["click", "observe"]}, routed_targets=["desktop", "desktop"])
+
+    def test_desktop_worker_does_not_accept_browser_actions(self):
+        capabilities = {"environment": "macos-desktop", "computer_targets": {"desktop": ["click"]}}
+        with self.assertRaisesRegex(ValueError, "does not support computer target: browser"):
+            Agent._route_computer({"action": "click", "target": "browser", "x": 8, "y": 7}, capabilities)
 
     async def test_manual_allow_and_cloud_bash_trust(self):
         steps = [("bash", {"command": "printf done > report.txt"})]

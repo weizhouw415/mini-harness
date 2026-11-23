@@ -35,6 +35,10 @@ class ApprovalRequest(BaseModel):
     approved: StrictBool
 
 
+class ApprovalModeRequest(BaseModel):
+    approval_mode: Literal["manual", "auto", "allow"]
+
+
 class ModelRequest(BaseModel):
     model: str = Field(max_length=256)
     base_url: str = Field(max_length=2048)
@@ -265,6 +269,13 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
                          event=("approval_decision", request.model_dump()))
         agent.schedule(run_id)
         return store.get(run_id)
+
+    @app.patch("/v1/runs/{run_id}/approval-mode", dependencies=control)
+    async def change_approval_mode(run_id: str, request: ApprovalModeRequest):
+        run, requeued = store.update_approval_mode(run_id, request.approval_mode)
+        if requeued:
+            agent.schedule(run_id)
+        return run
 
     @app.post("/v1/runs/{run_id}/resume", status_code=202, dependencies=control)
     async def resume_run(run_id: str):

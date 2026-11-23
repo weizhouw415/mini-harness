@@ -1,6 +1,6 @@
 # Mini Harness
 
-Mini Harness 用同一个 Agent Core 调用云端 Chromium 或用户主动连接的 macOS／Windows 桌面。模型每轮看到两个工具，`bash` 和 `computer_use`。同一次 Run 的浏览器、命令和文件都留在同一个 Worker。SQLite 保存会话、审批、工具轨迹和恢复状态，截图随工具结果回给支持视觉输入的模型。
+Mini Harness 用同一个 Agent Core 操作后台 Chromium 或已授权的 macOS／Windows 桌面。模型每轮看到两个工具，`bash` 和 `computer_use`。同一次 Run 的浏览器、命令和文件都留在同一个 Worker。SQLite 保存会话、审批、工具轨迹和恢复状态，截图随工具结果回给支持视觉输入的模型。
 
 ## 启动本地桌面版
 
@@ -10,7 +10,9 @@ Mini Harness 用同一个 Agent Core 调用云端 Chromium 或用户主动连接
 mini-harness local
 ```
 
-打开 [本地 Web UI](http://127.0.0.1:8000/) 并配置模型。macOS 需为启动进程的应用授予屏幕录制与辅助功能权限。Ctrl+C 停止服务和桌面 Worker。
+打开 [本地 Web UI](http://127.0.0.1:8000/) 并配置模型。本地启动器会启动桌面和云端浏览器两个 Worker。操作 macOS 当前桌面时，需为启动进程的应用授予屏幕录制与辅助功能权限。Ctrl+C 停止服务和两个 Worker。
+
+输入框下方默认选「桌面」，用于操作当前桌面和原生应用，点击和输入会使用实际鼠标或键盘。选择「云端浏览器」后，下一轮会在独立的 Chromium 会话里完成网页操作。每轮浏览器使用独立的标签页和登录状态，下载和上传使用该轮的工作目录。云端浏览器在本地启动时优先使用本机安装的 Chrome，也可用 `python -m playwright install chromium` 安装 Chromium，或通过 `MINI_CLOUD_BROWSER_EXECUTABLE` 指定浏览器。审批卡和运行轨迹会显示操作目标。
 
 ## 在无桌面的服务器上启动
 
@@ -53,9 +55,9 @@ Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromi
 | `MINI_DESKTOP_BASH_KIND` | Windows 上选择 `git-bash` 或 `wsl` |
 | `MINI_DESKTOP_BASH_PATH` | 可选的 Bash 或 WSL 可执行文件路径 |
 
-macOS 需为启动 Worker 的终端授予屏幕录制和辅助功能权限。Windows Worker 应从已登录、未锁屏的桌面启动。本地控制使用主屏幕坐标，当前键入支持 ASCII。桌面文件选择对话框可以通过坐标和键盘操作。云端的浏览器选择器、下载和上传动作在桌面上不适用。
+macOS 需为操作当前桌面的进程授予屏幕录制和辅助功能权限。Windows Worker 应从已登录、未锁屏的桌面启动。当前桌面的控制使用主屏幕坐标，键入支持 ASCII。桌面文件选择对话框可以通过坐标和键盘操作。浏览器选择器及自动下载上传适用于云端浏览器。
 
-运行 `python -m workers.desktop --pause` 或将鼠标移至主屏幕角落以触发暂停。移动鼠标离开角落后，用 `python -m workers.desktop --resume` 解除本地暂停。结束 Worker 进程会断开远程控制。
+运行 `python -m workers.desktop --pause` 可暂停 Worker。操作当前桌面时，也可以把鼠标移至主屏幕角落触发暂停。用 `python -m workers.desktop --resume` 解除本地暂停。结束 Worker 进程会断开远程控制。
 
 远程连接应使用 TLS。服务端可用 `HARNESS_WORKER_SECRETS` 的 JSON 映射为每个 Worker 配置独立密钥。WebSocket 通过双向 HMAC 握手认证，明文 WebSocket 只用于本机开发或专用 Docker 网络。
 
@@ -78,7 +80,7 @@ macOS 需为启动 Worker 的终端授予屏幕录制和辅助功能权限。Win
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。
 后续消息会携带此前已完成、失败或取消运行的完整事件记录。历史截图以轨迹中的附件引用保留，不会重新作为图片发送给模型；每次运行使用新的工作区和浏览器上下文。长对话可能超过模型服务的上下文限制。
 
-输入框下方的审批模式适用于下一条消息：
+输入框下方的审批模式可以在运行中切换。已经开始的工具操作会继续执行，正在等待审批和还未执行的操作按新模式判断。没有运行中的任务时，所选模式用于下一条消息。
 
 - **完全手动**：每次工具调用都需确认。
 - **自动审批**：桌面和浏览器 Worker 的截图和观察自动通过，浏览器还允许不移动指针的短距离滚动。启用了 Bash 的 Worker 可以自动运行 `pwd`、带字面量参数的 `echo` 和有限格式的 `printf`，浏览器 Worker 还支持列出当前目录的 `ls`。其他命令、导航、点击、输入及上传下载需要确认。运行轨迹会记录审批理由。
@@ -86,7 +88,7 @@ macOS 需为启动 Worker 的终端授予屏幕录制和辅助功能权限。Win
 
 在单一信任域中，可以设置 `HARNESS_TRUST_CLOUD_BASH=1`，让隔离的浏览器 Worker 在自动审批模式中运行任意 Bash 命令。
 
-FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
+FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为；未结束的 Run 可以用 `PATCH /v1/runs/{id}/approval-mode` 更改。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
 
 ```bash
 python -m pip install -e '.[cloud]'

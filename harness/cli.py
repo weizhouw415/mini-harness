@@ -24,8 +24,8 @@ def main():
     run.add_argument("--approval-mode", choices=("auto", "manual", "allow"), default="auto",
                      help="Tool approval policy (default: auto)")
     run.add_argument("--wait", action="store_true")
-    local = commands.add_parser("local", help="Start the local server and its worker")
-    local.add_argument("--headless", action="store_true", help="Use a browser worker without a desktop session")
+    local = commands.add_parser("local", help="Start the local server and workers")
+    local.add_argument("--headless", action="store_true", help="Start only the cloud browser worker")
     commands.add_parser("workers")
     index = commands.add_parser("skills")
     index.add_argument("--environment")

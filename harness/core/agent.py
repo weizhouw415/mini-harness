@@ -142,6 +142,8 @@ class Agent:
         started = {event["data"]["call_id"] for event in events if event["type"] == "tool_call"}
         approvals = {event["data"]["call_id"]: event["data"]["approved"]
                      for event in events if event["type"] == "approval_decision"}
+        requests = {event["data"]["call_id"]: event["data"]
+                    for event in events if event["type"] == "approval_requested"}
         for call in calls:
             call_id = call["call_id"]
             if call_id in outcomes:
@@ -149,8 +151,13 @@ class Agent:
             if call_id in started:
                 self._result(run_id, call, self._unknown())
                 continue
+            previous_request = requests.get(call_id)
             try:
                 args = self._arguments(call)
+                if call["name"] == "computer_use":
+                    # Execute the target shown at approval time, including old requests without a target.
+                    presented_args = previous_request["arguments"] if previous_request is not None else args
+                    args = self._route_computer(presented_args, capabilities)
             except ValueError as error:
                 self._result(run_id, call, {"error": str(error)})
                 continue
@@ -159,18 +166,22 @@ class Agent:
                 continue
             event = {"call_id": call_id, "tool": call["name"], "arguments": args}
             if call_id not in approvals:
+                approval_mode = self.store.get(run_id)["approval_mode"]
                 decision = decide_approval(
-                    run["approval_mode"], call["name"], args, capabilities,
+                    approval_mode, call["name"], args, capabilities,
                     trust_cloud_bash=self.settings.trust_cloud_bash,
                 )
                 if decision.needs_operator:
                     if decision.reason:
                         event["reason"] = decision.reason
+                    request_event = ("approval_requested", event) if event != previous_request else None
                     self.store.transition(run_id, {"running"}, "awaiting_approval", approval=event,
-                                          event=("approval_requested", event))
+                                          event=request_event)
                     return False
                 if decision.reason:
                     event["auto_approval_reason"] = decision.reason
+                elif previous_request is not None:
+                    event["auto_approval_reason"] = "审批模式已更新，操作直接执行。"
 
             self.store.event(run_id, "tool_call", event)
             try:
@@ -206,8 +217,11 @@ class Agent:
         if not isinstance(args.get("action"), str) or args["action"] not in COMPUTER_ACTIONS:
             raise ValueError("Unknown computer action.")
         for key, value in args.items():
-            allowed = schema.get(key, {}).get("type")
-            if (allowed == "string" and type(value) is str) or (allowed == "integer" and type(value) is int):
+            field = schema.get(key, {})
+            allowed = field.get("type")
+            if allowed == "string" and type(value) is str and ("enum" not in field or value in field["enum"]):
+                continue
+            if allowed == "integer" and type(value) is int:
                 continue
             raise ValueError(f"Invalid computer action argument: {key}.")
         if args["action"] == "navigate":
@@ -215,6 +229,23 @@ class Agent:
             if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password:
                 raise ValueError("Navigate requires an HTTP or HTTPS URL without embedded credentials.")
         return args
+
+    @staticmethod
+    def _route_computer(args: dict, capabilities: dict) -> dict:
+        native_target = "browser" if capabilities.get("environment") == "cloud-browser" else "desktop"
+        targets = capabilities.get("computer_targets")
+        if not isinstance(targets, dict):
+            if args.get("target", native_target) != native_target:
+                raise ValueError(f"This worker does not support computer target: {args['target']}.")
+            return args
+
+        target = args.get("target", native_target)
+        actions = targets.get(target)
+        if not isinstance(actions, list):
+            raise ValueError(f"This worker does not support computer target: {target}.")
+        if args["action"] not in actions:
+            raise ValueError(f"Computer action {args['action']} is unavailable on target {target}.")
+        return {**args, "target": target}
 
     @staticmethod
     def _unknown() -> dict:

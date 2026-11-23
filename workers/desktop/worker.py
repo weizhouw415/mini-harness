@@ -49,10 +49,11 @@ class WorkerBackend:
         return {"darwin": "macos-desktop", "win32": "windows-desktop"}.get(sys.platform, "unsupported-desktop")
 
     def capabilities(self) -> dict:
+        actions = list(ACTIONS) if self.desktop_enabled else []
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
             "computer": self.desktop_enabled, "download": False, "upload": False,
-            "actions": list(ACTIONS) if self.desktop_enabled else [],
+            "actions": actions, "computer_targets": {"desktop": actions},
         }
 
     def pause(self) -> None:
@@ -172,6 +173,8 @@ class WorkerBackend:
             return {"ok": True}
 
     async def computer(self, run_id: str, action: dict) -> dict:
+        if action.get("target", "desktop") != "desktop":
+            raise ValueError("This worker only accepts desktop computer actions")
         name = text_field(action, "action", limit=40)
         if name not in ACTIONS:
             raise ValueError(f"Unsupported desktop action: {name}")

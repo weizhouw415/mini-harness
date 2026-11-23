@@ -20,11 +20,13 @@ const actionLabels = {
   deny: ["approving", "正在提交审批"],
 };
 const approvalToolNames = { bash: "终端命令", computer_use: "界面操作" };
+const computerTargetNames = { browser: "后台浏览器", desktop: "当前桌面" };
 const actionButtons = [...document.querySelectorAll("[data-action]")];
 const idPattern = /^[a-f0-9]{32}$/;
+const workerNames = { desktop: "桌面", browser: "云端浏览器" };
 const approvalHints = {
   manual: "每次工具调用都等你确认",
-  auto: "桌面截图和观察可自动通过。浏览器还可自动滚动和运行简单命令。",
+  auto: "低风险操作自动通过，其他操作需确认",
   allow: "所有工具调用都直接执行",
 };
 sessionStorage.removeItem("harness-token");
@@ -33,6 +35,8 @@ let selected = "";
 let legacyRun = "";
 let run = null;
 let approvalTouched = false;
+let approvalRevision = 0;
+const approvalUpdates = new Map();
 let scrollToLatest = false;
 let conversationLoading = false;
 const turns = new Map();
@@ -42,7 +46,8 @@ let polling = false;
 let submitting = null;
 let acting = null;
 let historyKey = "";
-let workerKey = "";
+let workerTouched = false;
+let readyWorkers = {};
 const urls = new Set();
 
 function element(tag, content, className) {
@@ -90,6 +95,10 @@ function approvalHint() {
   $("approval-hint").textContent = approvalHints[$("approval-mode").value];
 }
 
+function computerTargetName(args) {
+  return Object.hasOwn(computerTargetNames, args?.target) ? computerTargetNames[args.target] : "";
+}
+
 function nearLatest() {
   const scroll = $("scroll");
   return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 24;
@@ -133,6 +142,14 @@ function pendingAction() {
   return run && acting?.id === run.id ? acting.action : "";
 }
 
+function pendingApprovalMode() {
+  return Boolean(run && approvalUpdates.has(run.id));
+}
+
+function chosenWorker() {
+  return readyWorkers[$("worker").value];
+}
+
 function setText(node, content) {
   if (node.textContent !== content) node.textContent = content;
 }
@@ -140,7 +157,7 @@ function setText(node, content) {
 function updateSendControl() {
   const pending = Boolean(pendingSubmission());
   const button = $("send");
-  button.disabled = !$("task").value.trim() || Boolean(submitting) ||
+  button.disabled = !$("task").value.trim() || !chosenWorker() || Boolean(submitting) ||
     Boolean((selected || legacyRun) && !run) || active.has(run?.status) || Boolean(pendingAction());
   button.setAttribute("aria-busy", String(pending));
   button.setAttribute("aria-label", pending ? "正在发送" : "发送消息");
@@ -150,6 +167,7 @@ function updateSendControl() {
 function showRunControls() {
   const pending = pendingSubmission();
   const currentAction = pendingAction();
+  const changingApprovalMode = pendingApprovalMode();
   const hasConversation = Boolean(selected || legacyRun || pending);
   $("empty").hidden = hasConversation;
   $("conversation-loading").hidden = !conversationLoading;
@@ -164,17 +182,26 @@ function showRunControls() {
   status.dataset.state = state;
   status.hidden = !label;
   setText(status, label);
-  $("approval").hidden = !run?.approval || run.status !== "awaiting_approval";
-  const tool = run?.approval?.tool;
-  setText($("approval-tool"), Object.hasOwn(approvalToolNames, tool) ? approvalToolNames[tool] : tool || "");
-  const reason = run?.approval?.reason || "";
+  const approval = run?.approval;
+  $("approval").hidden = !approval || run.status !== "awaiting_approval";
+  const tool = approval?.tool;
+  const toolName = Object.hasOwn(approvalToolNames, tool) ? approvalToolNames[tool] : tool || "";
+  const args = approval?.arguments;
+  const target = tool === "computer_use" ? computerTargetName(args) : "";
+  const desktopInput = target && args.target === "desktop"
+    && ["click", "type", "press", "scroll"].includes(args.action);
+  const toolDetails = [toolName, target, desktopInput ? "会使用鼠标或键盘" : ""].filter(Boolean);
+  setText($("approval-tool"), toolDetails.join(" · "));
+  const reason = approval?.reason || "";
   setText($("approval-reason"), reason);
   $("approval-reason").hidden = !reason;
-  setText($("approval-detail"), run?.approval ? JSON.stringify(run.approval.arguments, null, 2) : "");
+  setText($("approval-detail"), args ? JSON.stringify(args, null, 2) : "");
+  $("approval-mode").disabled = conversationLoading;
+  $("approval-mode").setAttribute("aria-busy", String(changingApprovalMode));
   for (const button of actionButtons) {
     if (button.dataset.action === "resume") button.hidden = run?.status !== "paused";
     if (button.dataset.action === "cancel") button.hidden = !active.has(run?.status);
-    button.disabled = Boolean(acting);
+    button.disabled = Boolean(acting) || (changingApprovalMode && ["allow", "deny"].includes(button.dataset.action));
     button.setAttribute("aria-busy", String(currentAction === button.dataset.action));
   }
   $("run").querySelector(".run-actions").hidden = !active.has(run?.status);
@@ -249,17 +276,20 @@ function showHistory(sessions) {
 function showWorkers(workers) {
   const online = workers.filter((worker) => worker.connected);
   connection(online.length);
-  const options = online.map((worker) => [
-    worker.worker_id, worker.environment + (worker.run_id ? " · 忙碌" : ""),
-  ]);
-  const key = JSON.stringify(options);
-  if (workerKey === key) return;
-  workerKey = key;
-  const previous = $("worker").value;
-  $("worker").replaceChildren(new Option("自动选择（桌面优先）", ""), ...options.map(
-    ([id, description]) => new Option(id + " · " + description, id),
-  ));
-  if (options.some(([id]) => id === previous)) $("worker").value = previous;
+  const desktops = workers.filter((worker) => ["macos-desktop", "windows-desktop"].includes(worker.environment)
+    && worker.capabilities?.computer !== false);
+  const browsers = workers.filter((worker) => worker.environment === "cloud-browser");
+  const workerSelect = $("worker");
+  readyWorkers = {};
+  for (const [mode, candidates] of Object.entries({ desktop: desktops, browser: browsers })) {
+    const ready = candidates.find((worker) => worker.connected && !worker.run_id);
+    if (ready) readyWorkers[mode] = ready.worker_id;
+    const availability = ready ? "" : candidates.some((worker) => worker.connected) ? "（忙碌）" : "（离线）";
+    const option = [...workerSelect.options].find((item) => item.value === mode);
+    setText(option, workerNames[mode] + availability);
+  }
+  if (!workerTouched) workerSelect.value = desktops.length || !browsers.length ? "desktop" : "browser";
+  updateSendControl();
 }
 
 async function showScreenshot(container, name, id) {
@@ -354,7 +384,9 @@ function refreshTraceStep(step, status) {
   const result = step.result || {};
   const [tone, label] = traceStepState(step, status);
   const action = Object.hasOwn(traceActions, args.action) ? traceActions[args.action] : "操作电脑";
-  step.title.textContent = step.tool === "bash" ? "执行命令" : step.tool === "computer_use" ? action : step.tool || "工具操作";
+  const target = computerTargetName(args);
+  const computerTitle = target ? target + " · " + action : action;
+  step.title.textContent = step.tool === "bash" ? "执行命令" : step.tool === "computer_use" ? computerTitle : step.tool || "工具操作";
   step.caption.textContent = result.error || args.command || args.url || args.path || args.key || args.selector
     || result.title || result.url || result.path || "";
   step.caption.hidden = !step.caption.textContent;
@@ -670,8 +702,10 @@ function showTurns(values) {
   preserveScroll(() => {
     values.forEach((value, index) => paintTurn(value, index));
     run = values[values.length - 1] || null;
-    if (run && !approvalTouched && Object.hasOwn(approvalHints, run.approval_mode)) {
-      $("approval-mode").value = run.approval_mode;
+    const requestedMode = approvalUpdates.get(run?.id)?.mode;
+    const mode = requestedMode || run?.approval_mode;
+    if ((requestedMode || !approvalTouched || active.has(run?.status)) && Object.hasOwn(approvalHints, mode)) {
+      $("approval-mode").value = mode;
       approvalHint();
     }
     showRunControls();
@@ -686,9 +720,10 @@ async function refresh() {
   if (polling) return;
   polling = true;
   const version = revision;
+  const approvalVersion = approvalRevision;
   try {
-    const detail = pendingSubmission() || pendingAction() ? "" : selected ? "/v1/sessions/" + selected + "/runs" :
-      legacyRun ? "/v1/runs/" + legacyRun : "";
+    const detail = pendingSubmission() || pendingAction() || pendingApprovalMode() ? "" :
+      selected ? "/v1/sessions/" + selected + "/runs" : legacyRun ? "/v1/runs/" + legacyRun : "";
     const [recent, workers, current] = await Promise.allSettled([
       api("/v1/sessions"), api("/v1/workers"), ...(detail ? [api(detail)] : []),
     ]);
@@ -696,6 +731,7 @@ async function refresh() {
     if (workers.status === "fulfilled") showWorkers(workers.value);
     else connection(null);
     if (recent.status === "fulfilled") showHistory(recent.value);
+    if (approvalVersion !== approvalRevision) return;
     if (current?.status === "fulfilled") {
       if (legacyRun) {
         select("session/" + current.value.session_id);
@@ -718,7 +754,59 @@ async function refresh() {
     }
   } finally {
     polling = false;
-    if (version !== revision) void refresh();
+    if (version !== revision || approvalVersion !== approvalRevision) void refresh();
+  }
+}
+
+async function updateApprovalMode(id, mode) {
+  const current = approvalUpdates.get(id);
+  if (current) {
+    current.mode = mode;
+    return;
+  }
+  const update = { mode };
+  approvalUpdates.set(id, update);
+  approvalRevision++;
+  if (run?.id === id) {
+    approvalTouched = true;
+    $("approval-mode").value = mode;
+    approvalHint();
+    showRunControls();
+    if ($("notice").dataset.source === "approval-mode") notice();
+  }
+  try {
+    let value;
+    let requestedMode;
+    do {
+      requestedMode = update.mode;
+      try {
+        value = await api("/v1/runs/" + id + "/approval-mode", {
+          method: "PATCH", body: { approval_mode: requestedMode },
+        });
+      } catch (error) {
+        if (requestedMode === update.mode) throw error;
+      }
+    } while (requestedMode !== update.mode);
+    if (run?.id === id) {
+      preserveScroll(() => {
+        run = value;
+        paintTurn(value);
+      });
+    }
+  } catch (error) {
+    if (run?.id === id) {
+      if (error.status !== 409) {
+        approvalTouched = false;
+        $("approval-mode").value = Object.hasOwn(approvalHints, run.approval_mode) ? run.approval_mode : "auto";
+        approvalHint();
+      }
+      notice("审批模式未更新：" + error.message, "approval-mode");
+    }
+  } finally {
+    approvalUpdates.delete(id);
+    approvalRevision++;
+    if (run?.id === id) preserveScroll(showRunControls);
+    void refresh();
   }
 }
 
@@ -790,11 +878,12 @@ $("composer").addEventListener("submit", async (event) => {
   const version = ++revision;
   const origin = draftKey();
   const body = {
-    task, worker_id: $("worker").value || null, session_id: selected || null,
+    task, worker_id: chosenWorker(), session_id: selected || null,
     approval_mode: $("approval-mode").value,
   };
   const placeholder = pendingTurn(task);
-  submitting = { version };
+  const submission = { version, approvalMode: body.approval_mode };
+  submitting = submission;
   input.value = "";
   resizeComposer();
   $("turns").append(placeholder);
@@ -817,6 +906,9 @@ $("composer").addEventListener("submit", async (event) => {
         });
       }
     }
+    if (submission.approvalMode !== body.approval_mode && active.has(value.status)) {
+      void updateApprovalMode(value.id, submission.approvalMode);
+    }
   } catch (error) {
     if (origin === draftKey() && !input.value) input.value = draft;
     else if (origin !== draftKey() && !drafts.has(origin)) drafts.set(origin, draft);
@@ -838,15 +930,16 @@ for (const button of actionButtons) {
     const action = button.dataset.action;
     const id = run.id;
     const approval = action === "allow" || action === "deny";
-    if (approval && !run.approval) return;
+    if (approval && (!run.approval || pendingApprovalMode())) return;
     const body = approval ? { call_id: run.approval.call_id, approved: action === "allow" } : undefined;
     const version = ++revision;
+    const approvalVersion = approvalRevision;
     acting = { id, action };
     showRunControls();
     notice();
     try {
       const value = await api("/v1/runs/" + id + "/" + (approval ? "approve" : action), { method: "POST", body });
-      if (version === revision) {
+      if (version === revision && approvalVersion === approvalRevision && !pendingApprovalMode()) {
         revision++;
         preserveScroll(() => {
           run = value;
@@ -891,6 +984,14 @@ $("example").addEventListener("click", () => {
 $("approval-mode").addEventListener("change", () => {
   approvalTouched = true;
   approvalHint();
+  const mode = $("approval-mode").value;
+  const submission = pendingSubmission();
+  if (submission) submission.approvalMode = mode;
+  else if (active.has(run?.status)) void updateApprovalMode(run.id, mode);
+});
+$("worker").addEventListener("change", () => {
+  workerTouched = true;
+  updateSendControl();
 });
 $("task").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;

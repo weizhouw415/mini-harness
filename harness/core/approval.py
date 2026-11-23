@@ -33,17 +33,20 @@ def decide_approval(mode: ApprovalMode, tool: str, args: dict, capabilities: dic
         return ApprovalDecision(True, "命令超出简单终端命令规则，需要人工确认。")
 
     action = args["action"]
-    actions = capabilities.get("actions")
+    target = args.get("target", "browser" if cloud else "desktop")
+    targets = capabilities.get("computer_targets")
+    actions = targets.get(target) if isinstance(targets, dict) else capabilities.get("actions")
     if capabilities.get("computer") is not True or not isinstance(actions, list) or action not in actions:
         return ApprovalDecision(True, "此 Worker 未声明支持该操作的自动审批。")
-    if action in {"observe", "screenshot"} and set(args) == {"action"}:
-        if cloud:
+    fields = set(args) - {"target"}
+    if action in {"observe", "screenshot"} and fields == {"action"}:
+        if target == "browser":
             return ApprovalDecision(False, "仅截图或观察当前浏览器页面。")
         if desktop:
             return ApprovalDecision(False, "仅查看当前已授权桌面 Worker 的屏幕。")
-    if cloud and action == "scroll" and set(args) <= {"action", "dx", "dy"}:
+    if target == "browser" and action == "scroll" and fields <= {"action", "dx", "dy"}:
         if all(abs(args.get(axis, 0)) <= 4_000 for axis in ("dx", "dy")):
             return ApprovalDecision(False, "仅滚动当前浏览器页面，未移动指针。")
-    if cloud:
+    if target == "browser":
         return ApprovalDecision(True, "操作超出浏览器观察和滚动规则，需要人工确认。")
-    return ApprovalDecision(True, "此桌面操作需要人工确认。")
+    return ApprovalDecision(True, "此操作可能使用你的实际桌面、鼠标或键盘，需要人工确认。")
