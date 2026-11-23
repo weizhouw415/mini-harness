@@ -7,14 +7,14 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from harness.config import Settings
+from harness.core.approval import decide_approval
 from harness.core.context import TOOLS, build_messages
 from harness.core.llm import LLM, ModelError
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
-from harness.storage.sqlite import ApprovalMode, RunStore
+from harness.storage.sqlite import RunStore
 
 logger = logging.getLogger(__name__)
 COMPUTER_ACTIONS = {name for name in TOOLS[1]["function"]["parameters"]["properties"]["action"]["enum"]}
-CLOUD_OBSERVATION_ACTIONS = {"observe", "screenshot"}
 
 
 class Agent:
@@ -157,15 +157,22 @@ class Agent:
             if approvals.get(call_id) is False:
                 self._result(run_id, call, {"error": "The operator declined this action."})
                 continue
-            if call_id not in approvals and self._needs_approval(
-                run["approval_mode"], call["name"], args, capabilities,
-            ):
-                approval = {"call_id": call_id, "tool": call["name"], "arguments": args}
-                self.store.transition(run_id, {"running"}, "awaiting_approval", approval=approval,
-                                      event=("approval_requested", approval))
-                return False
+            event = {"call_id": call_id, "tool": call["name"], "arguments": args}
+            if call_id not in approvals:
+                decision = decide_approval(
+                    run["approval_mode"], call["name"], args, capabilities,
+                    trust_cloud_bash=self.settings.trust_cloud_bash,
+                )
+                if decision.needs_operator:
+                    if decision.reason:
+                        event["reason"] = decision.reason
+                    self.store.transition(run_id, {"running"}, "awaiting_approval", approval=event,
+                                          event=("approval_requested", event))
+                    return False
+                if decision.reason:
+                    event["auto_approval_reason"] = decision.reason
 
-            self.store.event(run_id, "tool_call", {"call_id": call_id, "tool": call["name"], "arguments": args})
+            self.store.event(run_id, "tool_call", event)
             try:
                 if call["name"] == "bash":
                     result = await self.workers.bash(worker_id, run_id, call_id, args["command"], args["timeout"])
@@ -208,15 +215,6 @@ class Agent:
             if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password:
                 raise ValueError("Navigate requires an HTTP or HTTPS URL without embedded credentials.")
         return args
-
-    def _needs_approval(self, mode: ApprovalMode, tool: str, args: dict, capabilities: dict) -> bool:
-        if mode == "allow":
-            return False
-        if mode == "manual" or capabilities.get("environment") != "cloud-browser":
-            return True
-        if tool == "bash":
-            return not self.settings.trust_cloud_bash
-        return mode == "auto" and args["action"] not in CLOUD_OBSERVATION_ACTIONS
 
     @staticmethod
     def _unknown() -> dict:

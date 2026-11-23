@@ -295,13 +295,7 @@ class WorkerManager:
         if any(item.run_id == run_id for item in self._reservations.values()):
             raise WorkerUnavailable(f"Run {run_id} is already reserved")
         if worker_id is None:
-            worker_id = next((
-                key for key, item in sorted(self._workers.items())
-                if item.capabilities["environment"] == "cloud-browser"
-                and key not in self._reservations
-            ), None)
-        if worker_id is None:
-            raise WorkerUnavailable("No cloud browser worker is available")
+            worker_id = self._default_worker_id()
         worker = self._workers.get(worker_id)
         if worker is None:
             raise WorkerUnavailable(f"Worker {worker_id} is offline")
@@ -320,6 +314,23 @@ class WorkerManager:
             self._reservations.pop(worker_id, None)
             raise
         return worker
+
+    def _default_worker_id(self) -> str:
+        desktop_ids = sorted(
+            worker_id for worker_id, capabilities in self._known_workers.items()
+            if capabilities.get("environment") in {"macos-desktop", "windows-desktop"}
+            and capabilities.get("computer") is True
+        )
+        if desktop_ids:
+            for worker_id in desktop_ids:
+                if worker_id in self._workers and worker_id not in self._reservations:
+                    return worker_id
+            raise WorkerUnavailable("Desktop workers are busy or offline. Resume when one is available.")
+
+        for worker_id, worker in sorted(self._workers.items()):
+            if worker.capabilities["environment"] == "cloud-browser" and worker_id not in self._reservations:
+                return worker_id
+        raise WorkerUnavailable("No cloud browser worker is available")
 
     async def resume(
         self, worker_id: str, run_id: str, workspace_id: str

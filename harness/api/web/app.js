@@ -24,7 +24,7 @@ const actionButtons = [...document.querySelectorAll("[data-action]")];
 const idPattern = /^[a-f0-9]{32}$/;
 const approvalHints = {
   manual: "每次工具调用都等你确认",
-  auto: "自动放行云端截图和观察，其余操作按策略审批",
+  auto: "桌面截图和观察可自动通过。浏览器还可自动滚动和运行简单命令。",
   allow: "所有工具调用都直接执行",
 };
 sessionStorage.removeItem("harness-token");
@@ -167,6 +167,9 @@ function showRunControls() {
   $("approval").hidden = !run?.approval || run.status !== "awaiting_approval";
   const tool = run?.approval?.tool;
   setText($("approval-tool"), Object.hasOwn(approvalToolNames, tool) ? approvalToolNames[tool] : tool || "");
+  const reason = run?.approval?.reason || "";
+  setText($("approval-reason"), reason);
+  $("approval-reason").hidden = !reason;
   setText($("approval-detail"), run?.approval ? JSON.stringify(run.approval.arguments, null, 2) : "");
   for (const button of actionButtons) {
     if (button.dataset.action === "resume") button.hidden = run?.status !== "paused";
@@ -253,7 +256,7 @@ function showWorkers(workers) {
   if (workerKey === key) return;
   workerKey = key;
   const previous = $("worker").value;
-  $("worker").replaceChildren(new Option("自动选择 Worker", ""), ...options.map(
+  $("worker").replaceChildren(new Option("自动选择（桌面优先）", ""), ...options.map(
     ([id, description]) => new Option(id + " · " + description, id),
   ));
   if (options.some(([id]) => id === previous)) $("worker").value = previous;
@@ -414,10 +417,22 @@ function recordTraceCall(view, event, id) {
     step.args = data.arguments;
     showTraceField(step.fields.args, step.args);
   }
-  if (type === "tool_call") step.started = true;
-  if (type === "approval_decision") {
+  let approvalLabel;
+  if (type === "tool_call") {
+    step.started = true;
+    if (data.auto_approval_reason) {
+      approvalLabel = "自动通过";
+      step.approvalReason = data.auto_approval_reason;
+    }
+  } else if (type === "approval_requested" && data.reason) {
+    approvalLabel = "待确认";
+    step.approvalReason = data.reason;
+  } else if (type === "approval_decision") {
     step.approved = data.approved;
-    step.approval.textContent = data.approved ? "审批通过" : "审批拒绝";
+    approvalLabel = data.approved ? "审批通过" : "审批拒绝";
+  }
+  if (approvalLabel) {
+    step.approval.textContent = step.approvalReason ? approvalLabel + " · " + step.approvalReason : approvalLabel;
     step.approval.hidden = false;
   }
   if (type === "tool_result") {

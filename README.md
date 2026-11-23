@@ -2,15 +2,25 @@
 
 Mini Harness 用同一个 Agent Core 调用云端 Chromium 或用户主动连接的 macOS／Windows 桌面。模型每轮看到两个工具，`bash` 和 `computer_use`。同一次 Run 的浏览器、命令和文件都留在同一个 Worker。SQLite 保存会话、审批、工具轨迹和恢复状态，截图随工具结果回给支持视觉输入的模型。
 
-## 启动云端版本
+## 启动本地桌面版
 
-需要 Docker Compose 和一个支持 OpenAI Chat Completions 工具调用与图片输入的模型服务。复制 `.env.example` 为 `.env`，填入模型配置，再为 API 和 Worker 分别设置随机密钥。可以用 `python -c 'import secrets; print(secrets.token_urlsafe(32))'` 各生成一次。
+在 macOS 或 Windows 的已登录桌面中，先运行 `python -m pip install -e '.[desktop]'`。在环境变量或 `.harness/local.env` 中配置 `HARNESS_API_TOKEN` 和 `HARNESS_WORKER_SECRET`，可以用 `python -c 'import secrets; print(secrets.token_urlsafe(32))'` 各生成一次。然后运行：
 
-本机 macOS 开发环境可用 `mini-harness local` 同时启动 Web UI、浏览器 Worker 和桌面 Worker。先安装 `python -m pip install -e '.[cloud,desktop]'`，并在环境变量或 `.harness/local.env` 中配置 `HARNESS_API_TOKEN` 和 `HARNESS_WORKER_SECRET`。如需指定浏览器，可设置 `MINI_CLOUD_BROWSER_EXECUTABLE`。启动终端需要获得 macOS 屏幕录制与辅助功能权限。Ctrl+C 停止服务和两个 Worker。
+```bash
+mini-harness local
+```
+
+打开 [本地 Web UI](http://127.0.0.1:8000/) 并配置模型。macOS 需为启动进程的应用授予屏幕录制与辅助功能权限。Ctrl+C 停止服务和桌面 Worker。
+
+## 在无桌面的服务器上启动
+
+Docker Compose 会启动浏览器 Worker。复制 `.env.example` 为 `.env`，填入 API 和 Worker 密钥及支持 OpenAI Chat Completions 工具调用与图片输入的模型配置。
 
 ```bash
 docker compose up --build
 ```
+
+直接在无桌面的机器上运行时，可安装 `python -m pip install -e '.[cloud]'`，用 `python -m playwright install chromium` 安装浏览器或用 `MINI_CLOUD_BROWSER_EXECUTABLE` 指定已有浏览器，然后运行 `mini-harness local --headless`。Linux 上 `mini-harness local` 默认使用浏览器 Worker。
 
 API 默认只监听宿主机的 `127.0.0.1:8000`。可在 `.env` 中设置 `HARNESS_PORT` 更换宿主机端口，并为 CLI 设置对应的 `HARNESS_URL`。下面示例在另一个终端运行。先将 `.env` 中的 API 密钥设置为该终端的 `HARNESS_API_TOKEN`。
 
@@ -21,9 +31,9 @@ mini-harness run '打开 https://example.com，截图并告诉我页面标题。
 mini-harness trace RUN_ID
 ```
 
-使用 `--session SESSION_ID` 延续会话，使用 `--worker WORKER_ID` 固定选择节点。若节点暂时不可用，服务会返回 `paused`。节点在线后，用 `mini-harness resume RUN_ID` 继续。已经绑定的 Run 需要原 Worker 和原工作区。如果 Worker 进程重启并丢失工作区，请启动新 Run。断线发生在操作发出之后时，轨迹会记录结果未知，Agent 可以先观察再决定下一步。用 `mini-harness cancel RUN_ID` 取消并释放节点。
+自动选择优先使用桌面 Worker。服务尚未识别到启用了桌面控制的 Worker 时，才会自动选择浏览器 Worker。如果已知的桌面 Worker 都忙碌或离线，任务会暂停，待桌面可用后可用 `mini-harness resume RUN_ID` 继续。使用 `--worker WORKER_ID` 可指定节点，使用 `--session SESSION_ID` 可延续会话。已经绑定的 Run 需要原 Worker 和原工作区。如果 Worker 进程重启并丢失工作区，请启动新 Run。断线发生在操作发出之后时，轨迹会记录结果未知，Agent 可以先观察再决定下一步。用 `mini-harness cancel RUN_ID` 取消并释放节点。
 
-默认每条 Bash 命令进入 `awaiting_approval`，所有本地桌面操作也会进入相同状态。通过 `mini-harness status RUN_ID` 查看完整待审批动作，再运行 `mini-harness approve RUN_ID CALL_ID allow` 或将 `allow` 改为 `deny`。在单一信任域中，可以设置 `HARNESS_TRUST_CLOUD_BASH=1` 让隔离云端 Worker 自动运行 Bash。
+`mini-harness run` 默认使用自动审批，可用 `--approval-mode manual` 或 `--approval-mode allow` 切换模式。`--wait` 遇到待审批操作时会返回 Run ID 和操作详情。用 `mini-harness approve RUN_ID CALL_ID allow` 放行，或用 `deny` 拒绝。通过 `mini-harness status RUN_ID` 查看后续状态。
 
 Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromium 浏览器上下文。下载路径和上传文件都相对于该目录。任务文件随 Run 关闭而清理，截图和工具轨迹保存在服务端。容器是云端的隔离边界。共享一个 Worker 容器的任务应属于同一信任域。部署时，将 Worker 与内网服务和宿主机敏感资源隔开。对不可信任务使用独立的 Worker 容器，并保留 Bash 审批。
 
@@ -71,10 +81,12 @@ macOS 需为启动 Worker 的终端授予屏幕录制和辅助功能权限。Win
 输入框下方的审批模式适用于下一条消息：
 
 - **完全手动**：每次工具调用都需确认。
-- **自动审批**：云端浏览器的截图和观察直接执行。云端 Bash 仅在服务端已设置信任时直接执行，其余操作需要确认。
+- **自动审批**：桌面和浏览器 Worker 的截图和观察自动通过，浏览器还允许不移动指针的短距离滚动。启用了 Bash 的 Worker 可以自动运行 `pwd`、带字面量参数的 `echo` 和有限格式的 `printf`，浏览器 Worker 还支持列出当前目录的 `ls`。其他命令、导航、点击、输入及上传下载需要确认。运行轨迹会记录审批理由。
 - **完全允许**：工具调用直接执行。Worker 自己的权限限制继续生效。
 
-FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
+在单一信任域中，可以设置 `HARNESS_TRUST_CLOUD_BASH=1`，让隔离的浏览器 Worker 在自动审批模式中运行任意 Bash 命令。
+
+FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
 
 ```bash
 python -m pip install -e '.[cloud]'

@@ -58,13 +58,14 @@
       </div>
       <div id="run" hidden>
         <div id="turns"></div>
-        <section class="approval" id="approval" aria-labelledby="approval-title" hidden>
+        <section class="approval" id="approval" aria-labelledby="approval-title" aria-describedby="approval-reason" hidden>
           <div class="approval-heading">
             <span class="approval-icon" aria-hidden="true">
               <svg class="icon" viewBox="0 0 24 24"><path d="M12 22s7-3.5 7-10V5l-7-3-7 3v7c0 6.5 7 10 7 10Z"/><path d="M12 8v4m0 3h.01"/></svg>
             </span>
             <div><h2 id="approval-title">等待你审批</h2><p id="approval-tool"></p></div>
           </div>
+          <p id="approval-reason" hidden></p>
           <pre id="approval-detail"></pre>
           <div class="approval-buttons">
             <button data-action="deny" type="button">拒绝</button>
@@ -92,7 +93,7 @@
         <div class="options">
           <label class="select-control">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
-            <select id="worker" aria-label="选择 Worker"><option value="">自动选择 Worker</option></select>
+            <select id="worker" aria-label="选择 Worker"><option value="">自动选择（桌面优先）</option></select>
           </label>
           <label class="select-control">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s7-3.5 7-10V5l-7-3-7 3v7c0 6.5 7 10 7 10Z"/><path d="m9 12 2 2 4-4"/></svg>

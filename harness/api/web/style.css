@@ -484,6 +484,7 @@ pre {
 
 .approval-heading h2 { margin: 0; font-size: 14px; }
 .approval-heading p { margin: 1px 0 0; color: #766345; font-size: 12px; overflow-wrap: anywhere; }
+#approval-reason { margin: 10px 0 0; color: #766345; font-size: 13px; overflow-wrap: anywhere; }
 .approval pre { margin: 12px 0; padding: 9px 11px; border-radius: 8px; background: #f6eddc; }
 .approval-buttons, .run-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .run-actions:has(button:not([hidden])) { margin-top: 12px; }
