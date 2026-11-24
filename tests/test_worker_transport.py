@@ -7,10 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 from PIL import Image
 
+from harness.api.server import create_app
+from harness.config import Settings
 from harness.execution.protocol import ARTIFACT_CHUNK_BYTES, decode
 from harness.execution.router import WorkerConnection, WorkerManager, WorkerUnavailable
+from tests.harness_support import wait_for_run
 from workers.common.transport import _Runtime
 from workers.desktop.worker import WorkerBackend
 
@@ -53,6 +57,52 @@ class WorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(await self.manager.acquire(None, "run-1", "ws-1"), browser)
         disabled.request.assert_not_awaited()
+
+    async def test_targeted_page_runs_can_generate_concurrently(self):
+        self.connect("desktop", "macos-desktop")
+        self.connect("cloud", "cloud-browser")
+        self.connect("cloud-2", "cloud-browser")
+        started = {task: asyncio.Event() for task in ("first", "second", "third")}
+        finish = asyncio.Event()
+
+        async def complete(messages, tools):
+            task = messages[-1]["content"]
+            started[task].set()
+            await finish.wait()
+            return {"content": f"Reply to {task}"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(data_dir=Path(directory), api_token="test-token")
+            app = create_app(settings, worker_manager=self.manager, llm=SimpleNamespace(complete=complete))
+            transport = httpx.ASGITransport(app=app)
+            async with app.router.lifespan_context(app), httpx.AsyncClient(
+                transport=transport, base_url="http://127.0.0.1",
+                headers={"Authorization": "Bearer test-token"},
+            ) as client:
+                async def start(task, target):
+                    response = await client.post("/v1/runs", json={"task": task, "worker_target": target})
+                    return response.raise_for_status().json()
+
+                async with asyncio.timeout(5):
+                    first = await start("first", "auto")
+                    await started["first"].wait()
+                    desktop = await start("desktop only", "desktop")
+                    paused = await wait_for_run(client, desktop["id"], "paused")
+                    self.assertIsNone(paused["worker_id"])
+                    self.assertEqual(paused["worker_target"], "desktop")
+
+                    second, third = await asyncio.gather(start("second", "auto"), start("third", "browser"))
+                    await asyncio.gather(started["second"].wait(), started["third"].wait())
+                    self.assertEqual(len({run["session_id"] for run in (first, second, third)}), 3)
+                    running = [app.state.store.get(run["id"]) for run in (first, second, third)]
+                    self.assertTrue(all(run["status"] == "running" for run in running))
+                    self.assertEqual(running[0]["worker_id"], "desktop")
+                    self.assertEqual({run["worker_id"] for run in running[1:]}, {"cloud", "cloud-2"})
+
+                    finish.set()
+                    for run in running:
+                        done = await wait_for_run(client, run["id"], "completed")
+                        self.assertEqual(done["output"], f"Reply to {run['task']}")
 
 
 class WorkerTransportTest(unittest.IsolatedAsyncioTestCase):

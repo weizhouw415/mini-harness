@@ -66,6 +66,10 @@ class Agent:
         try:
             if worker_id:
                 worker = await self.workers.resume(worker_id, run_id, run["workspace_id"])
+            elif run["worker_target"]:
+                worker = await self.workers.acquire_target(
+                    run["worker_target"], run_id, run["workspace_id"], on_reserved=bind,
+                )
             else:
                 worker = await self.workers.acquire(
                     run["requested_worker"], run_id, run["workspace_id"], on_reserved=bind,

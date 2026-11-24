@@ -100,7 +100,8 @@
           <label class="select-control">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
             <select id="worker" aria-label="选择执行方式" title="用于下一次发送">
-              <option value="desktop" selected>桌面</option>
+              <option value="auto" selected>自动选择</option>
+              <option value="desktop">桌面</option>
               <option value="browser">云端浏览器</option>
             </select>
           </label>
@@ -120,25 +121,53 @@
       <div class="composer-hints"><span id="approval-hint"></span><span id="typing-hint"><kbd>Enter</kbd> 发送 <span class="hint-separator">·</span> <kbd>Shift+Enter</kbd> 换行</span></div>
     </form>
   </main>
-  <dialog id="file-dialog" aria-labelledby="file-dialog-title">
-    <div class="file-dialog-heading">
-      <div>
-        <h2 id="file-dialog-title"></h2>
-        <p id="file-dialog-meta"></p>
+  <div id="file-panel-scrim" aria-hidden="true" hidden></div>
+  <aside id="file-panel" aria-labelledby="file-panel-title" hidden>
+    <header class="file-panel-toolbar">
+      <div class="file-panel-label">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M15 5v14"/></svg>
+        文件预览
       </div>
-      <button id="close-file" type="button" aria-label="关闭预览" title="关闭预览" autofocus>
-        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
-      </button>
+      <div class="file-panel-actions">
+        <button id="download-file" type="button" aria-label="下载文件" title="下载文件">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m-4-4 4 4 4-4M5 16v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/></svg>
+          <span>下载</span>
+        </button>
+        <button id="close-file" type="button" aria-label="关闭预览" title="关闭预览">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+    </header>
+    <div class="file-panel-heading">
+      <div>
+        <h2 id="file-panel-title"></h2>
+        <p id="file-panel-meta"></p>
+      </div>
+      <label id="file-version-control" hidden>
+        <span>版本</span>
+        <select id="file-version"></select>
+      </label>
     </div>
-    <div id="file-preview" aria-live="polite"></div>
-    <p class="file-error" id="file-download-error" role="alert" hidden></p>
-    <div class="dialog-actions">
-      <button class="primary" id="download-file" type="button">下载文件</button>
+    <div class="file-panel-body" tabindex="0" role="region" aria-label="文件内容">
+      <p class="file-error" id="file-download-error" role="alert" hidden></p>
+      <div id="file-preview" aria-live="polite"></div>
     </div>
-  </dialog>
+  </aside>
   <dialog id="model-dialog" aria-labelledby="model-dialog-title">
-    <form id="model-form">
-      <h2 id="model-dialog-title">模型设置</h2>
+    <h2 id="model-dialog-title">模型设置</h2>
+    <div id="provider-list-view">
+      <p class="provider-intro">保存多个模型供应商，随时切换当前使用的配置。</p>
+      <p class="provider-intro">启用、修改或删除当前配置会影响进行中任务的后续模型请求。</p>
+      <div id="provider-list" aria-live="polite"></div>
+      <div class="dialog-actions">
+        <button id="close-settings" type="button">关闭</button>
+        <button id="add-provider" class="primary" type="button">添加供应商</button>
+      </div>
+    </div>
+    <form id="model-form" hidden>
+      <h3 id="provider-form-title">添加供应商</h3>
+      <label for="provider-name">供应商名称</label>
+      <input id="provider-name" required maxlength="256" placeholder="例如 OpenAI、公司内部服务">
       <label for="base-url">Base URL</label>
       <input id="base-url" type="url" required maxlength="2048" placeholder="https://api.example.com/v1">
       <label for="api-key">API Key</label>
@@ -148,11 +177,11 @@
       <label for="model-name">模型名</label>
       <input id="model-name" required maxlength="256" placeholder="模型 ID">
       <div class="dialog-actions">
-        <button id="close-settings" type="button">关闭</button>
+        <button id="cancel-provider" type="button">返回</button>
         <button class="primary" type="submit">保存</button>
       </div>
-      <p id="model-error" role="alert" hidden></p>
     </form>
+    <p id="model-error" role="alert" hidden></p>
   </dialog>
 </body>
 </html>

@@ -5,7 +5,7 @@ import base64
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -24,6 +24,9 @@ from .protocol import (
     validate_artifact_response,
     verify_proof,
 )
+
+
+WorkerTarget = Literal["auto", "browser", "desktop"]
 
 
 class WorkerUnavailable(RuntimeError):
@@ -332,21 +335,48 @@ class WorkerManager:
             raise
         return worker
 
+    async def acquire_target(
+        self,
+        target: WorkerTarget,
+        run_id: str,
+        workspace_id: str,
+        *,
+        on_reserved: Callable[[WorkerConnection], None],
+    ) -> WorkerConnection:
+        targets = ("desktop", "browser") if target == "auto" else (target,)
+        for mode in targets:
+            worker_id = self._available_worker_id(mode)
+            if worker_id is not None:
+                return await self.acquire(worker_id, run_id, workspace_id, on_reserved=on_reserved)
+        raise WorkerUnavailable({
+            "auto": "No desktop or cloud browser worker is available. Resume when one is available.",
+            "browser": "No cloud browser worker is available. Resume when one is available.",
+            "desktop": "Desktop workers are busy or offline. Resume when one is available.",
+        }[target])
+
+    @staticmethod
+    def _matches_target(capabilities: dict[str, Any], target: Literal["browser", "desktop"]) -> bool:
+        environment = capabilities["environment"]
+        if target == "browser":
+            return environment == "cloud-browser"
+        return environment in {"macos-desktop", "windows-desktop"} and capabilities.get("computer") is True
+
+    def _available_worker_id(self, target: Literal["browser", "desktop"]) -> str | None:
+        for worker_id, worker in sorted(self._workers.items()):
+            if worker_id not in self._reservations and self._matches_target(worker.capabilities, target):
+                return worker_id
+        return None
+
     def _default_worker_id(self) -> str:
-        desktop_ids = sorted(
-            worker_id for worker_id, capabilities in self._known_workers.items()
-            if capabilities.get("environment") in {"macos-desktop", "windows-desktop"}
-            and capabilities.get("computer") is True
-        )
-        if desktop_ids:
-            for worker_id in desktop_ids:
-                if worker_id in self._workers and worker_id not in self._reservations:
-                    return worker_id
+        if any(self._matches_target(capabilities, "desktop") for capabilities in self._known_workers.values()):
+            worker_id = self._available_worker_id("desktop")
+            if worker_id is not None:
+                return worker_id
             raise WorkerUnavailable("Desktop workers are busy or offline. Resume when one is available.")
 
-        for worker_id, worker in sorted(self._workers.items()):
-            if worker.capabilities["environment"] == "cloud-browser" and worker_id not in self._reservations:
-                return worker_id
+        worker_id = self._available_worker_id("browser")
+        if worker_id is not None:
+            return worker_id
         raise WorkerUnavailable("No cloud browser worker is available")
 
     async def resume(

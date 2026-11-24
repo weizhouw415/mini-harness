@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const names = {
   queued: "排队中", running: "运行中", awaiting_approval: "等待审批",
   paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消",
+  submitting: "正在发送", send_failed: "发送失败",
 };
 const active = new Set(["queued", "running", "awaiting_approval", "paused"]);
 const progressLabels = {
@@ -36,25 +37,26 @@ const fileSourceNames = { output: "输出文件", preview: "运行预览" };
 const textPreviewLimit = 256 * 1024;
 sessionStorage.removeItem("harness-token");
 let modelConfig = null;
-let selected = "";
-let legacyRun = "";
+const conversations = new Map();
+const draftConversations = new Map();
+const startedSessions = new Map();
+let draftSequence = 0;
+let newDraft = createDraft();
+let conversation = newDraft;
+let recentSessions = [];
 let run = null;
-let approvalTouched = false;
-let approvalRevision = 0;
 const approvalUpdates = new Map();
+const actions = new Map();
 let scrollToLatest = false;
 let conversationLoading = false;
 const turns = new Map();
-const drafts = new Map();
-let draftFiles = [];
 let filePreview = null;
+const filePanelOverlay = matchMedia("(max-width: 1120px)");
 let revision = 0;
-let polling = false;
-let submitting = null;
-let acting = null;
+let overviewPolling = false;
+let detailRevision = -1;
 let historyKey = "";
-let workerTouched = false;
-let readyWorkers = {};
+const readyWorkers = new Set();
 const urls = new Set();
 const visibleHistoryTurns = new IntersectionObserver((entries) => {
   for (const { target, isIntersecting } of entries) {
@@ -77,6 +79,11 @@ function notice(message = "", source = "") {
   $("notice").textContent = message;
   $("notice").hidden = !message;
   $("notice").dataset.source = source;
+}
+
+function conversationNotice(origin, message = "", source = "") {
+  origin.notice = { message, source };
+  if (origin === conversation) notice(message, source);
 }
 
 async function request(path, { method = "GET", body, extraHeaders, timeout = 12000 } = {}) {
@@ -148,29 +155,30 @@ function resizeComposer() {
   input.style.height = input.scrollHeight + "px";
 }
 
-function draftKey() {
-  return selected ? "session/" + selected : legacyRun;
+function createDraft() {
+  return { key: "draft/" + ++draftSequence, task: "", files: [] };
 }
 
-function saveDraft(key, task, files) {
-  if (task || files.length) drafts.set(key, { task, files });
-  else drafts.delete(key);
+function getConversation(key) {
+  if (!conversations.has(key)) conversations.set(key, { key, task: "", files: [] });
+  return conversations.get(key);
 }
 
 function pendingSubmission() {
-  return submitting?.version === revision ? submitting : null;
+  return conversation.submission;
 }
 
 function pendingAction() {
-  return run && acting?.id === run.id ? acting.action : "";
+  return actions.get(run?.id);
 }
 
 function pendingApprovalMode() {
   return Boolean(run && approvalUpdates.has(run.id));
 }
 
-function chosenWorker() {
-  return readyWorkers[$("worker").value];
+function workerAvailable() {
+  const target = $("worker").value;
+  return target === "auto" ? readyWorkers.size > 0 : readyWorkers.has(target);
 }
 
 function setText(node, content) {
@@ -180,8 +188,8 @@ function setText(node, content) {
 function updateSendControl() {
   const pending = Boolean(pendingSubmission());
   const button = $("send");
-  button.disabled = !($("task").value.trim() || draftFiles.length) || !chosenWorker() || Boolean(submitting) ||
-    Boolean((selected || legacyRun) && !run) || active.has(run?.status) || Boolean(pendingAction());
+  button.disabled = !($("task").value.trim() || conversation.files.length) || !workerAvailable() || pending ||
+    (!conversation.key.startsWith("draft/") && !run) || active.has(run?.status) || Boolean(pendingAction());
   button.setAttribute("aria-busy", String(pending));
   button.setAttribute("aria-label", pending ? "正在发送" : "发送消息");
   $("task").readOnly = pending;
@@ -191,7 +199,7 @@ function showRunControls() {
   const pending = pendingSubmission();
   const currentAction = pendingAction();
   const changingApprovalMode = pendingApprovalMode();
-  const hasConversation = Boolean(selected || legacyRun || pending);
+  const hasConversation = !conversation.key.startsWith("draft/") || Boolean(pending);
   $("empty").hidden = hasConversation;
   $("conversation-loading").hidden = !conversationLoading;
   $("run").hidden = !turns.size && !pending;
@@ -226,7 +234,7 @@ function showRunControls() {
   for (const button of actionButtons) {
     if (button.dataset.action === "resume") button.hidden = run?.status !== "paused";
     if (button.dataset.action === "cancel") button.hidden = !active.has(run?.status);
-    button.disabled = Boolean(acting) || (changingApprovalMode && ["allow", "deny"].includes(button.dataset.action));
+    button.disabled = Boolean(currentAction) || (changingApprovalMode && ["allow", "deny"].includes(button.dataset.action));
     button.setAttribute("aria-busy", String(currentAction === button.dataset.action));
   }
   $("run").querySelector(".run-actions").hidden = !active.has(run?.status);
@@ -241,59 +249,67 @@ function sidebar(open) {
 
 function select(hash, initial = null) {
   const sessionId = hash.startsWith("session/") ? hash.slice("session/".length) : "";
-  saveDraft(draftKey(), $("task").value, draftFiles);
+  const next = idPattern.test(sessionId) || idPattern.test(hash) ? getConversation(hash) :
+    draftConversations.get(hash) || newDraft;
+  conversation.task = $("task").value;
+  conversation = next;
   revision++;
-  selected = idPattern.test(sessionId) ? sessionId : "";
-  legacyRun = idPattern.test(hash) ? hash : "";
-  const draft = drafts.get(draftKey());
-  $("task").value = draft?.task || "";
-  draftFiles = draft?.files || [];
+  $("task").value = conversation.task;
   attachmentError();
   showDraftFiles();
   resizeComposer();
-  const nextHash = selected ? "#session/" + selected : legacyRun ? "#" + legacyRun : location.pathname;
-  history.replaceState(null, "", nextHash);
+  history.replaceState(null, "", conversation.key.startsWith("draft/") ? location.pathname : "#" + conversation.key);
   for (const button of $("history").querySelectorAll("button")) {
-    button.setAttribute("aria-current", String(button.dataset.id === selected));
+    button.setAttribute("aria-current", String(button.dataset.key === conversation.key));
   }
   for (const url of urls) URL.revokeObjectURL(url);
   urls.clear();
-  if ($("file-dialog").open) $("file-dialog").close();
+  closeFilePanel(false);
   visibleHistoryTurns.disconnect();
   turns.clear();
   $("turns").replaceChildren();
   run = null;
-  conversationLoading = Boolean(selected || legacyRun) && !initial;
-  approvalTouched = false;
-  $("approval-mode").value = "auto";
-  approvalHint();
+  conversationLoading = !conversation.key.startsWith("draft/") && !initial;
+  showApprovalMode();
   scrollToLatest = true;
   sidebar(false);
-  notice();
+  notice(conversation.notice?.message, conversation.notice?.source);
+  const pending = pendingSubmission();
+  if (pending) $("turns").append(pending.placeholder);
   if (initial) showTurns([initial]);
   else {
     showRunControls();
+    if (pending) scrollToEnd();
     updateJump();
   }
-  void refresh();
+  refresh();
 }
 
-function showHistory(sessions) {
-  const key = JSON.stringify(sessions);
+function showHistory() {
+  const sessionHistory = [...startedSessions.values(), ...recentSessions].map((item) => {
+    const key = "session/" + item.id;
+    const status = conversations.get(key)?.submission ? "submitting" : item.status;
+    return { key, title: item.title, status };
+  });
+  const draftHistory = [...draftConversations.values()].reverse().map((item) => ({
+    key: item.key, title: item.title, status: item.submission ? "submitting" : "send_failed",
+  }));
+  const items = [...draftHistory, ...sessionHistory];
+  const key = JSON.stringify(items);
   if (historyKey === key) return;
   historyKey = key;
-  const nodes = sessions.map((item) => {
+  const nodes = items.map((item) => {
     const button = element("button");
     button.type = "button";
     button.title = item.title + " · " + names[item.status];
-    button.dataset.id = item.id;
-    button.setAttribute("aria-current", String(item.id === selected));
+    button.dataset.key = item.key;
+    button.setAttribute("aria-current", String(item.key === conversation.key));
     const dot = element("i");
     dot.dataset.state = item.status;
     button.append(dot, element("span", item.title));
     button.addEventListener("click", () => {
       const wasOpen = $("sidebar").classList.contains("open");
-      if (item.id !== selected) select("session/" + item.id);
+      if (item.key !== conversation.key) select(item.key);
       else sidebar(false);
       if (wasOpen) $("scroll").focus({ preventScroll: true });
     });
@@ -306,18 +322,17 @@ function showWorkers(workers) {
   const online = workers.filter((worker) => worker.connected);
   connection(online.length);
   const desktops = workers.filter((worker) => ["macos-desktop", "windows-desktop"].includes(worker.environment)
-    && worker.capabilities?.computer !== false);
+    && worker.capabilities?.computer === true);
   const browsers = workers.filter((worker) => worker.environment === "cloud-browser");
   const workerSelect = $("worker");
-  readyWorkers = {};
+  readyWorkers.clear();
   for (const [mode, candidates] of Object.entries({ desktop: desktops, browser: browsers })) {
-    const ready = candidates.find((worker) => worker.connected && !worker.run_id);
-    if (ready) readyWorkers[mode] = ready.worker_id;
+    const ready = candidates.some((worker) => worker.connected && !worker.run_id);
+    if (ready) readyWorkers.add(mode);
     const availability = ready ? "" : candidates.some((worker) => worker.connected) ? "（忙碌）" : "（离线）";
     const option = [...workerSelect.options].find((item) => item.value === mode);
     setText(option, workerNames[mode] + availability);
   }
-  if (!workerTouched) workerSelect.value = desktops.length || !browsers.length ? "desktop" : "browser";
   updateSendControl();
 }
 
@@ -334,7 +349,13 @@ async function showScreenshot(container, name, id) {
     await image.decode();
     if (!container.isConnected) return;
     urls.add(url);
-    preserveScroll(() => container.replaceChildren(image), false);
+    const button = element("button", undefined, "trace-image-open");
+    button.type = "button";
+    button.title = "查看 Worker 截图";
+    button.setAttribute("aria-label", button.title);
+    bindFileTrigger(button, { name, source: "preview", size: blob.size, mime_type: blob.type }, id, { localFile: blob });
+    button.append(image);
+    preserveScroll(() => container.replaceChildren(button), false);
   } catch {
     if (container.isConnected) {
       preserveScroll(() => container.replaceChildren(element("p", "截图读取失败。", "trace-note")), false);
@@ -373,30 +394,79 @@ async function fileData({ file, runId, localFile }, limit) {
   return limit ? data.slice(0, limit) : data;
 }
 
-function clearFilePreview() {
+function releaseFilePreview() {
   if (filePreview?.url) URL.revokeObjectURL(filePreview.url);
+  filePreview?.trigger.setAttribute("aria-expanded", "false");
   filePreview = null;
-  $("file-preview").replaceChildren();
 }
 
-async function showFile(file, runId, localFile) {
-  clearFilePreview();
-  const preview = { file, runId, localFile };
+function syncFilePanelMode() {
+  const panel = $("file-panel");
+  const overlay = filePanelOverlay.matches && !panel.hidden;
+  $("sidebar").inert = overlay;
+  document.querySelector("main").inert = overlay;
+  $("file-panel-scrim").hidden = !overlay;
+  if (overlay) {
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    if (!panel.contains(document.activeElement)) $("close-file").focus({ preventScroll: true });
+  } else {
+    panel.removeAttribute("role");
+    panel.removeAttribute("aria-modal");
+  }
+}
+
+function toggleFilePanel(open) {
+  preserveScroll(() => {
+    $("file-panel").hidden = !open;
+    document.body.classList.toggle("file-panel-open", open);
+    syncFilePanelMode();
+    resizeComposer();
+  });
+}
+
+function closeFilePanel(restoreFocus = true) {
+  if (!filePreview) return;
+  const trigger = filePreview.trigger;
+  releaseFilePreview();
+  $("file-preview").replaceChildren();
+  $("file-version").replaceChildren();
+  toggleFilePanel(false);
+  if (restoreFocus) (trigger.getClientRects().length ? trigger : $("scroll")).focus({ preventScroll: true });
+}
+
+async function showFile(file, runId, trigger, { localFile, versions = [file] } = {}) {
+  const moveFocus = filePreview?.trigger !== trigger;
+  releaseFilePreview();
+  const preview = { file, runId, trigger, localFile, versions };
   filePreview = preview;
   const type = filePreviewType(file);
   const content = $("file-preview");
-  const dialog = $("file-dialog");
-  setText($("file-dialog-title"), file.name);
-  setText($("file-dialog-meta"), fileSummary(file));
+  const folderPath = file.source === "output" && file.path !== file.name ? file.path : "";
+  setText($("file-panel-title"), file.name);
+  setText($("file-panel-meta"), [fileSummary(file), folderPath].filter(Boolean).join(" · "));
+  $("file-version-control").hidden = versions.length < 2;
+  const versionOptions = versions.length > 1 ? versions.map((version, index) => {
+    const option = element("option", "第 " + version.version + " 版" + (index === 0 ? "（最新）" : ""));
+    option.value = String(index);
+    option.selected = version === file;
+    return option;
+  }) : [];
+  $("file-version").replaceChildren(...versionOptions);
+  trigger.setAttribute("aria-expanded", "true");
   $("file-download-error").hidden = true;
   $("download-file").disabled = false;
-  content.append(element("p", type ? "正在读取预览…" : "此文件可下载后查看。", "file-preview-note"));
-  if (!dialog.open) dialog.showModal();
+  content.dataset.kind = type.startsWith("image/") ? "image" : type || "file";
+  content.replaceChildren(element("p", type ? "正在读取预览…" : "下载原件后查看文件内容。", "file-preview-note"));
+  if ($("file-panel").hidden) toggleFilePanel(true);
+  content.parentElement.scrollTop = 0;
+  if (moveFocus) $("close-file").focus({ preventScroll: true });
   if (!type) return;
   try {
     const limit = type === "text" && file.size > textPreviewLimit ? textPreviewLimit : undefined;
     const data = await fileData(preview, limit);
     if (filePreview !== preview) return;
+    if (!limit) preview.data = data;
     if (type === "text") {
       const text = await data.text();
       if (filePreview !== preview) return;
@@ -416,6 +486,16 @@ async function showFile(file, runId, localFile) {
   }
 }
 
+function bindFileTrigger(button, file, runId, options = {}) {
+  const { localFile, versions = [file] } = options;
+  const selected = Boolean(filePreview && filePreview.runId === runId && (localFile
+    ? filePreview.localFile === localFile : versions.some((version) => version.id === filePreview.file.id)));
+  button.setAttribute("aria-controls", "file-panel");
+  button.setAttribute("aria-expanded", String(selected));
+  if (selected) filePreview.trigger = button;
+  button.addEventListener("click", () => void showFile(file, runId, button, options));
+}
+
 function fileCard(file, runId, localFile, remove) {
   const item = element("li", undefined, "file-card");
   const button = element("button", undefined, "file-open");
@@ -424,7 +504,7 @@ function fileCard(file, runId, localFile, remove) {
   const copy = element("span", undefined, "file-copy");
   copy.append(element("span", file.name, "file-name"), element("span", fileSummary(file), "file-meta"));
   button.append(traceIcon("file"), copy);
-  button.addEventListener("click", () => void showFile(file, runId, localFile));
+  bindFileTrigger(button, file, runId, { localFile });
   item.append(button);
   if (remove) {
     const dismiss = element("button", undefined, "file-remove");
@@ -445,17 +525,17 @@ function attachmentError(message = "") {
 
 function showDraftFiles() {
   const container = $("attachment-draft");
-  container.hidden = !draftFiles.length;
-  $("attach").disabled = submitting?.origin === draftKey();
-  container.replaceChildren(...draftFiles.map((entry, index) => fileCard(entry.file, null, entry.file, () => {
-    if (submitting?.origin === draftKey()) return;
+  container.hidden = !conversation.files.length;
+  $("attach").disabled = Boolean(pendingSubmission());
+  container.replaceChildren(...conversation.files.map((entry, index) => fileCard(entry.file, null, entry.file, () => {
+    if (pendingSubmission()) return;
     preserveScroll(() => {
-      draftFiles = draftFiles.filter((candidate) => candidate !== entry);
+      conversation.files = conversation.files.filter((candidate) => candidate !== entry);
       attachmentError();
       showDraftFiles();
     });
     updateSendControl();
-    (container.children[Math.min(index, draftFiles.length - 1)]?.querySelector(".file-remove") || $("attach")).focus();
+    (container.children[Math.min(index, conversation.files.length - 1)]?.querySelector(".file-remove") || $("attach")).focus();
   })));
 }
 
@@ -469,6 +549,57 @@ function promptMessage(task) {
   return { node, files };
 }
 
+function artifactGrid(groups, runId) {
+  const grid = element("ul", undefined, "artifact-grid");
+  for (const versions of groups) {
+    const file = versions[0];
+    const item = element("li", undefined, "artifact-card");
+    const button = element("button", undefined, "file-open");
+    button.type = "button";
+    button.title = file.path || file.name;
+    const format = element("span", undefined, "artifact-format");
+    const type = filePreviewType(file);
+    format.dataset.kind = type.startsWith("image/") ? "image" : type || "file";
+    const extension = /\.([a-z\d]{1,5})$/i.exec(file.name)?.[1];
+    format.setAttribute("aria-hidden", "true");
+    format.append(extension ? extension.toUpperCase() : traceIcon("file"));
+    const info = [fileSize(file.size)];
+    if (versions.length > 1) info.push(versions.length + " 个版本");
+    const copy = element("span", undefined, "file-copy");
+    copy.append(element("span", file.name, "file-name"), element("span", info.join(" · "), "file-meta"));
+    button.append(format, copy, traceIcon("chevron"));
+    bindFileTrigger(button, file, runId, { versions });
+    item.append(button);
+    grid.append(item);
+  }
+  return grid;
+}
+
+function artifactGroup(files, source, runId, expanded) {
+  const byPath = new Map();
+  // API order is oldest first, including versions of a path.
+  for (const file of [...files].reverse()) {
+    const path = file.path || file.id;
+    if (!byPath.has(path)) byPath.set(path, []);
+    byPath.get(path).push(file);
+  }
+  const groups = [...byPath.values()];
+  const section = element("section", undefined, "artifact-group");
+  section.dataset.source = source;
+  const visible = source === "preview" ? 6 : groups.length;
+  section.append(element("h4", source === "output" ? "交付文件" : fileSourceNames.preview),
+    artifactGrid(groups.slice(0, visible), runId));
+  if (groups.length > visible) {
+    const details = element("details", undefined, "artifact-more");
+    details.open = expanded;
+    const summary = element("summary");
+    summary.append(traceIcon("chevron"), element("span", "其余 " + (groups.length - visible) + " 项预览"));
+    details.append(summary, artifactGrid(groups.slice(visible), runId));
+    section.append(details);
+  }
+  return section;
+}
+
 function renderTurnFiles(view, value) {
   const files = value.files;
   if (!Array.isArray(files)) return;
@@ -476,11 +607,16 @@ function renderTurnFiles(view, value) {
   if (view.filesKey === key) return;
   view.filesKey = key;
   const uploads = files.filter((file) => file.source === "upload");
-  const outputs = files.filter((file) => Object.hasOwn(fileSourceNames, file.source));
+  const outputs = files.filter((file) => file.source === "output");
+  const previews = files.filter((file) => file.source === "preview");
   view.uploads.hidden = !uploads.length;
-  view.outputs.hidden = !outputs.length;
+  view.outputs.hidden = !outputs.length && !previews.length;
   view.uploads.replaceChildren(...uploads.map((file) => fileCard(file, value.id)));
-  view.outputFiles.replaceChildren(...outputs.map((file) => fileCard(file, value.id)));
+  const expanded = Boolean(view.outputFiles.querySelector(".artifact-more[open]"));
+  const groups = [];
+  if (outputs.length) groups.push(artifactGroup(outputs, "output", value.id, false));
+  if (previews.length) groups.push(artifactGroup(previews, "preview", value.id, expanded));
+  view.outputFiles.replaceChildren(...groups);
 }
 
 function assistantMessage(text) {
@@ -496,6 +632,7 @@ const traceIcons = {
   terminal: "m5 7 5 5-5 5m8 0h6",
   message: "M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.8-3.6A7.5 7.5 0 1 1 20 11.5Z",
   file: "M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10ZM13 3v7h7m-11 5h6m-6 3h6",
+  folder: "M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z",
   close: "m6 6 12 12M18 6 6 18",
 };
 const traceActions = {
@@ -629,6 +766,7 @@ function recordTraceCall(view, event, id) {
   }
   let approvalLabel;
   if (type === "tool_call") {
+    if (!step.started) view.toolCallCount++;
     step.started = true;
     if (data.auto_approval_reason) {
       approvalLabel = "自动通过";
@@ -795,6 +933,7 @@ function appendEvents(view, events, id) {
       if (typeof data.reasoning_content === "string") generation.reasoning += data.reasoning_content;
       view.phase = "generating";
     } else if (type === "assistant") {
+      view.modelResponseCount++;
       const generation = assistantGeneration(view, event);
       generation.reasoning = data.message?.reasoning_content ?? generation.reasoning;
       generation.content = data.message?.content ?? "";
@@ -825,13 +964,13 @@ function appendEvents(view, events, id) {
   }
   if (view.generation) paintGeneration(view, view.generation);
   paintRunProgress(view);
-  const count = view.calls.size;
-  view.traceCount.textContent = count ? count + " 次工具操作" : "";
-  view.traceCount.hidden = !count;
+  const { toolCallCount, modelResponseCount } = view;
+  setText(view.traceCount, toolCallCount + " 次工具调用");
+  view.traceCount.hidden = !toolCallCount;
   view.tracePending.hidden = view.timeline.childElementCount > 0;
   view.tracePending.textContent = active.has(view.traceStatus) ? "等待执行步骤…" : "暂无执行步骤";
   view.raw.hidden = !view.eventLog.length;
-  view.rawCount.textContent = view.eventLog.length + " 条";
+  setText(view.traceTotals, toolCallCount + " 次工具调用 · " + modelResponseCount + " 轮模型响应");
   showRawEvents(view);
 }
 
@@ -905,8 +1044,8 @@ function createTurn(value) {
   const raw = element("details", undefined, "trace-log");
   raw.hidden = true;
   const rawSummary = element("summary");
-  const rawCount = element("span", undefined, "trace-log-count");
-  rawSummary.append(traceIcon("chevron"), element("span", "原始事件"), rawCount);
+  const traceTotals = element("span", undefined, "trace-log-count");
+  rawSummary.append(traceIcon("chevron"), element("span", "原始事件"), traceTotals);
   const rawEntries = element("div", undefined, "trace-log-entries");
   raw.append(rawSummary, rawEntries);
   body.append(timeline, tracePending, traceError, raw);
@@ -915,8 +1054,10 @@ function createTurn(value) {
   const answer = element("div", undefined, "turn-answer");
   const outputs = element("section", undefined, "turn-outputs");
   outputs.hidden = true;
-  const outputFiles = element("ul", undefined, "file-list");
-  outputs.append(element("h3", "运行产物"), outputFiles);
+  const outputFiles = element("div");
+  const outputHeading = element("h3", undefined, "artifact-heading");
+  outputHeading.append(traceIcon("folder"), "运行产物");
+  outputs.append(outputHeading, outputFiles);
   const response = element("div", undefined, "turn-response");
   response.append(trace, answer, outputs);
   const prompt = promptMessage(value.task);
@@ -924,7 +1065,8 @@ function createTurn(value) {
   const view = {
     node, trace, timeline, tracePending, traceError, traceCount, traceStatusLabel, answer,
     uploads: prompt.files, outputs, outputFiles,
-    raw, rawCount, rawEntries, after: 0, eventLog: [], logRendered: 0, calls: new Map(), plannedCalls: new Map(),
+    raw, traceTotals, rawEntries, after: 0, eventLog: [], logRendered: 0, calls: new Map(), plannedCalls: new Map(),
+    toolCallCount: 0, modelResponseCount: 0,
   };
   summary.addEventListener("click", () => {
     view.tracePreference = !trace.open;
@@ -1012,16 +1154,21 @@ function paintTurn(value, index) {
   }
 }
 
+function showApprovalMode() {
+  const requestedMode = approvalUpdates.get(run?.id)?.mode || pendingSubmission()?.approvalMode;
+  const mode = requestedMode || (active.has(run?.status) ? run.approval_mode :
+    conversation.approvalMode || run?.approval_mode);
+  $("approval-mode").value = Object.hasOwn(approvalHints, mode) ? mode : "auto";
+  approvalHint();
+}
+
 function showTurns(values) {
+  const pending = pendingSubmission();
+  if (pending) values = values.slice(0, values.findIndex((value) => value.id === pending.previousRunId) + 1);
   preserveScroll(() => {
     values.forEach((value, index) => paintTurn(value, index));
     run = values[values.length - 1] || null;
-    const requestedMode = approvalUpdates.get(run?.id)?.mode;
-    const mode = requestedMode || run?.approval_mode;
-    if ((requestedMode || !approvalTouched || active.has(run?.status)) && Object.hasOwn(approvalHints, mode)) {
-      $("approval-mode").value = mode;
-      approvalHint();
-    }
+    showApprovalMode();
     showRunControls();
   });
   if (run && scrollToLatest) {
@@ -1030,49 +1177,71 @@ function showTurns(values) {
   }
 }
 
-async function refresh() {
-  if (polling) return;
-  polling = true;
-  const version = revision;
-  const approvalVersion = approvalRevision;
-  try {
-    const detail = pendingSubmission() || pendingAction() || pendingApprovalMode() ? "" :
-      selected ? "/v1/sessions/" + selected + "/runs" : legacyRun ? "/v1/runs/" + legacyRun : "";
-    const [recent, workers, current] = await Promise.allSettled([
-      api("/v1/sessions"), api("/v1/workers"), ...(detail ? [api(detail)] : []),
-    ]);
-    if (version !== revision) return;
-    if (workers.status === "fulfilled") showWorkers(workers.value);
-    else connection(null);
-    if (recent.status === "fulfilled") showHistory(recent.value);
-    if (approvalVersion !== approvalRevision) return;
-    if (current?.status === "fulfilled") {
-      if (legacyRun) {
-        select("session/" + current.value.session_id);
-        return;
-      }
-      conversationLoading = false;
-      showTurns(current.value);
-      if (run && active.has(run.status)) {
-        const view = turns.get(run.id);
-        if (view) void loadTrace(view, run.id);
-      }
-    } else if (current && conversationLoading) {
-      conversationLoading = false;
-      showRunControls();
-    }
-    const failure = [recent, workers, current].find((result) => result?.status === "rejected");
-    if ($("notice").hidden || $("notice").dataset.source === "refresh") {
-      const message = failure?.reason.message || "";
-      if ($("notice").textContent !== message) preserveScroll(() => notice(message, "refresh"));
-    }
-  } finally {
-    polling = false;
-    if (version !== revision || approvalVersion !== approvalRevision) void refresh();
+function refreshNotice(message, source) {
+  if (($("notice").hidden || $("notice").dataset.source === source) && $("notice").textContent !== message) {
+    preserveScroll(() => notice(message, source));
   }
 }
 
-async function updateApprovalMode(id, mode) {
+async function refreshOverview() {
+  if (overviewPolling) return;
+  overviewPolling = true;
+  try {
+    const [recent, workers] = await Promise.allSettled([api("/v1/sessions"), api("/v1/workers")]);
+    if (workers.status === "fulfilled") showWorkers(workers.value);
+    else connection(null);
+    if (recent.status === "fulfilled") {
+      recentSessions = recent.value;
+      for (const item of recentSessions) startedSessions.delete(item.id);
+      showHistory();
+    }
+    const failure = [recent, workers].find((result) => result.status === "rejected");
+    refreshNotice(failure?.reason.message || "", "overview");
+  } finally {
+    overviewPolling = false;
+  }
+}
+
+async function refreshConversation() {
+  if (conversation.key.startsWith("draft/") || detailRevision === revision ||
+      (!conversationLoading && (pendingAction() || pendingApprovalMode()))) return;
+  const version = revision;
+  const key = conversation.key;
+  const legacy = idPattern.test(key);
+  detailRevision = version;
+  try {
+    const path = legacy ? "/v1/runs/" + key : "/v1/sessions/" + key.slice("session/".length) + "/runs";
+    const values = await api(path);
+    if (version !== revision) return;
+    if (legacy) {
+      select("session/" + values.session_id);
+      return;
+    }
+    conversationLoading = false;
+    showTurns(values);
+    if (run && active.has(run.status)) {
+      const view = turns.get(run.id);
+      if (view) void loadTrace(view, run.id);
+    }
+    refreshNotice("", "detail");
+  } catch (error) {
+    if (version !== revision) return;
+    if (conversationLoading) {
+      conversationLoading = false;
+      showRunControls();
+    }
+    refreshNotice(error.message, "detail");
+  } finally {
+    if (detailRevision === version) detailRevision = -1;
+  }
+}
+
+function refresh() {
+  void refreshOverview();
+  void refreshConversation();
+}
+
+async function updateApprovalMode(origin, id, mode) {
   const current = approvalUpdates.get(id);
   if (current) {
     current.mode = mode;
@@ -1080,14 +1249,13 @@ async function updateApprovalMode(id, mode) {
   }
   const update = { mode };
   approvalUpdates.set(id, update);
-  approvalRevision++;
-  if (run?.id === id) {
-    approvalTouched = true;
-    $("approval-mode").value = mode;
-    approvalHint();
+  if (origin === conversation) {
+    revision++;
+    showApprovalMode();
     showRunControls();
-    if ($("notice").dataset.source === "approval-mode") notice();
   }
+  const version = revision;
+  if (origin.notice?.source === "approval-mode") conversationNotice(origin);
   try {
     let value;
     let requestedMode;
@@ -1101,78 +1269,163 @@ async function updateApprovalMode(id, mode) {
         if (requestedMode === update.mode) throw error;
       }
     } while (requestedMode !== update.mode);
-    if (run?.id === id) {
+    if (version === revision && run?.id === id && !pendingAction()) {
       preserveScroll(() => {
         run = value;
         paintTurn(value);
       });
     }
   } catch (error) {
-    if (run?.id === id) {
-      if (error.status !== 409) {
-        approvalTouched = false;
-        $("approval-mode").value = Object.hasOwn(approvalHints, run.approval_mode) ? run.approval_mode : "auto";
-        approvalHint();
-      }
-      notice("审批模式未更新：" + error.message, "approval-mode");
-    }
+    if (error.status !== 409 && origin.approvalMode === update.mode) origin.approvalMode = undefined;
+    conversationNotice(origin, "审批模式未更新：" + error.message, "approval-mode");
   } finally {
     approvalUpdates.delete(id);
-    approvalRevision++;
-    if (run?.id === id) preserveScroll(showRunControls);
-    void refresh();
+    if (origin === conversation) {
+      revision++;
+      preserveScroll(() => {
+        showApprovalMode();
+        showRunControls();
+      });
+    }
+    refresh();
   }
 }
 
+let editingProviderId = null;
+let defaultModelBaseUrl = "https://api.openai.com/v1";
+
 async function loadModel() {
-  modelConfig = await api("/ui/model");
+  modelConfig = await api("/ui/providers");
+  if (!modelConfig.providers.length) {
+    const defaults = await api("/ui/model");
+    defaultModelBaseUrl = defaults.base_url || defaultModelBaseUrl;
+  }
   return modelConfig;
 }
 
-function showSettings(config) {
-  $("base-url").value = config.base_url;
-  $("model-name").value = config.model;
+function modelError(message = "") {
+  $("model-error").textContent = message;
+  $("model-error").hidden = !message;
+}
+
+function showProviderList() {
   $("api-key").value = "";
-  $("key-hint").textContent = config.has_api_key
+  $("model-form").hidden = true;
+  $("provider-list-view").hidden = false;
+  modelError();
+  const list = $("provider-list");
+  list.replaceChildren();
+  if (!modelConfig.providers.length) {
+    list.append(element("p", "还没有保存供应商，请先添加一个。", "provider-empty"));
+    return;
+  }
+  for (const provider of modelConfig.providers) {
+    const card = element("div", undefined, "provider-card");
+    const heading = element("div", undefined, "provider-heading");
+    heading.append(element("span", provider.name, "provider-name"));
+    if (provider.id === modelConfig.active_provider_id) {
+      heading.append(element("span", "使用中", "provider-active"));
+    }
+    const detail = element("p", provider.model + " · " + provider.base_url, "provider-detail");
+    const actions = element("div", undefined, "provider-actions");
+    function button(label, action) {
+      const control = element("button", label);
+      control.type = "button";
+      control.addEventListener("click", action);
+      actions.append(control);
+    }
+    if (provider.id !== modelConfig.active_provider_id) {
+      button("启用", () => void updateProvider(provider, "activate"));
+    }
+    button("编辑", () => editProvider(provider));
+    button("删除", () => void updateProvider(provider, "delete"));
+    card.append(heading, detail, actions);
+    list.append(card);
+  }
+}
+
+function editProvider(provider = null) {
+  editingProviderId = provider?.id || null;
+  $("provider-form-title").textContent = provider ? "编辑供应商" : "添加供应商";
+  $("provider-name").value = provider?.name || "";
+  $("base-url").value = provider?.base_url || defaultModelBaseUrl;
+  $("model-name").value = provider?.model || "";
+  $("api-key").value = "";
+  $("key-hint").textContent = provider?.has_api_key
     ? "当前地址已保存密钥。留空会保留密钥，修改地址后需要重新输入。"
     : "模型服务允许匿名访问时可留空。";
   $("clear-key").checked = false;
-  $("clear-key-label").hidden = !config.has_api_key;
-  $("model-error").hidden = true;
-  if (!$("model-dialog").open) $("model-dialog").showModal();
+  $("clear-key-label").hidden = !provider?.has_api_key;
+  $("provider-list-view").hidden = true;
+  $("model-form").hidden = false;
+  modelError();
+  $("provider-name").focus();
+}
+
+async function updateProvider(provider, action) {
+  if (action === "delete") {
+    const remaining = modelConfig.providers.filter((item) => item.id !== provider.id);
+    const next = provider.id === modelConfig.active_provider_id
+      ? (remaining.length ? "删除后将启用“" + remaining[0].name + "”。" : "删除后需要重新添加供应商才能发送任务。")
+      : "";
+    if (!confirm("确定删除供应商“" + provider.name + "”？此操作无法撤销。" + next)) return;
+  }
+  const buttons = $("provider-list").querySelectorAll("button");
+  buttons.forEach((button) => { button.disabled = true; });
+  modelError();
+  try {
+    const path = "/ui/providers/" + encodeURIComponent(provider.id);
+    await api(action === "activate" ? path + "/activate" : path, {
+      method: action === "activate" ? "PUT" : "DELETE",
+    });
+    await loadModel();
+    showProviderList();
+  } catch (error) {
+    modelError(error.message);
+    buttons.forEach((button) => { button.disabled = false; });
+  }
 }
 
 async function openSettings(onlyIfMissing = false) {
   try {
     const config = await loadModel();
-    if ((!onlyIfMissing || !config.configured) && !$("model-dialog").open) showSettings(config);
+    if ((!onlyIfMissing || !config.configured) && !$("model-dialog").open) {
+      showProviderList();
+      $("model-dialog").showModal();
+      if (!config.providers.length) editProvider();
+      else if (!config.configured) {
+        const current = config.providers.find((provider) => provider.id === config.active_provider_id);
+        if (current) editProvider(current);
+      }
+    }
   } catch (error) {
     notice(error.message);
   }
 }
 
+$("add-provider").addEventListener("click", () => editProvider());
+$("cancel-provider").addEventListener("click", showProviderList);
 $("model-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("model-form").querySelector("[type=submit]");
   submit.disabled = true;
-  $("model-error").hidden = true;
+  modelError();
   try {
-    modelConfig = await api("/ui/model", {
-      method: "PUT",
+    const path = "/ui/providers" + (editingProviderId ? "/" + encodeURIComponent(editingProviderId) : "");
+    await api(path, {
+      method: editingProviderId ? "PUT" : "POST",
       body: {
+        name: $("provider-name").value.trim(),
         base_url: $("base-url").value.trim(),
         model: $("model-name").value.trim(),
         api_key: $("api-key").value.trim() || ($("clear-key").checked ? "" : null),
       },
     });
-    $("api-key").value = "";
-    $("model-dialog").close();
+    await loadModel();
+    showProviderList();
     notice();
-    sidebar(false);
-    $("task").focus();
   } catch (error) {
-    $("model-error").textContent = error.message;
-    $("model-error").hidden = false;
+    modelError(error.message);
   } finally {
     submit.disabled = false;
   }
@@ -1181,34 +1434,43 @@ $("model-form").addEventListener("submit", async (event) => {
 $("composer").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("task");
+  const origin = conversation;
   const draft = input.value;
   const task = draft.trim();
-  const attachments = draftFiles;
+  const attachments = origin.files;
   if ($("send").disabled) return;
   const draftVersion = revision;
   if (!modelConfig?.configured) {
     await openSettings(true);
     if (!modelConfig?.configured || draftVersion !== revision || input.value !== draft ||
-        draftFiles !== attachments || $("send").disabled) return;
+        origin.files !== attachments || $("send").disabled) return;
   }
-  const version = ++revision;
-  const origin = draftKey();
+  revision++;
   const body = {
-    task, worker_id: chosenWorker(), session_id: selected || null,
+    task, worker_target: $("worker").value,
+    session_id: origin.key.startsWith("session/") ? origin.key.slice("session/".length) : null,
     approval_mode: $("approval-mode").value,
   };
   const placeholder = pendingTurn(task, attachments);
-  const submission = { version, origin, approvalMode: body.approval_mode };
-  submitting = submission;
+  const submission = { placeholder, previousRunId: run?.id, approvalMode: body.approval_mode };
+  origin.submission = submission;
+  if (!body.session_id) {
+    origin.title = (task.split("\n")[0] || attachments[0]?.file.name || "新对话").slice(0, 160);
+    draftConversations.set(origin.key, origin);
+    if (origin === newDraft) newDraft = createDraft();
+  }
   input.value = "";
-  draftFiles = [];
+  origin.task = "";
+  origin.files = [];
   attachmentError();
   showDraftFiles();
   resizeComposer();
   $("turns").append(placeholder);
   showRunControls();
-  notice();
+  conversationNotice(origin);
+  showHistory();
   scrollToEnd();
+  let value;
   try {
     body.upload_ids = [];
     for (const entry of attachments) {
@@ -1223,73 +1485,82 @@ $("composer").addEventListener("submit", async (event) => {
       body.upload_ids.push(entry.upload.id);
     }
     if (attachments.length) setText(placeholder.querySelector(".activity-description"), "正在创建任务");
-    const value = await api("/v1/runs", { method: "POST", body });
-    if (version === revision) {
-      submitting = null;
-      placeholder.remove();
-      if (!selected) {
-        select("session/" + value.session_id, value);
-      } else {
-        revision++;
-        preserveScroll(() => {
-          run = value;
-          paintTurn(value);
-          showRunControls();
-        });
-      }
-    }
-    if (submission.approvalMode !== body.approval_mode && active.has(value.status)) {
-      void updateApprovalMode(value.id, submission.approvalMode);
-    }
+    body.approval_mode = submission.approvalMode;
+    value = await api("/v1/runs", { method: "POST", body });
   } catch (error) {
-    if (origin === draftKey()) {
-      if (!input.value) input.value = draft;
-      draftFiles = attachments;
-    } else {
-      saveDraft(origin, drafts.get(origin)?.task || draft, attachments);
-    }
-    if (version === revision) notice(error.message);
-  } finally {
-    submitting = null;
-    preserveScroll(() => {
-      placeholder.remove();
-      showDraftFiles();
-      resizeComposer();
-      showRunControls();
-    });
-    void refresh();
+    origin.task = draft;
+    origin.files = attachments;
+    conversationNotice(origin, error.message);
   }
+  origin.submission = null;
+  let destination = origin;
+  if (value && !body.session_id) {
+    draftConversations.delete(origin.key);
+    if (!recentSessions.some((item) => item.id === value.session_id)) {
+      startedSessions.set(value.session_id, {
+        id: value.session_id, title: origin.title, status: value.status,
+      });
+    }
+    destination = getConversation("session/" + value.session_id);
+    destination.approvalMode ??= origin.approvalMode;
+  }
+  if (conversation === origin) {
+    if (destination !== origin) select(destination.key, value);
+    else {
+      revision++;
+      preserveScroll(() => {
+        placeholder.remove();
+        input.value = origin.task;
+        if (value) {
+          run = value;
+          conversationLoading = false;
+          paintTurn(value);
+        }
+        showDraftFiles();
+        resizeComposer();
+        showRunControls();
+      });
+    }
+  }
+  showHistory();
+  if (value && submission.approvalMode !== body.approval_mode && active.has(value.status)) {
+    void updateApprovalMode(destination, value.id, submission.approvalMode);
+  }
+  refresh();
 });
 
 for (const button of actionButtons) {
   button.addEventListener("click", async () => {
-    if (acting || !run) return;
+    if (!run || pendingAction()) return;
+    const origin = conversation;
     const action = button.dataset.action;
     const id = run.id;
     const approval = action === "allow" || action === "deny";
     if (approval && (!run.approval || pendingApprovalMode())) return;
     const body = approval ? { call_id: run.approval.call_id, approved: action === "allow" } : undefined;
     const version = ++revision;
-    const approvalVersion = approvalRevision;
-    acting = { id, action };
+    actions.set(id, action);
     showRunControls();
-    notice();
+    conversationNotice(origin);
     try {
       const value = await api("/v1/runs/" + id + "/" + (approval ? "approve" : action), { method: "POST", body });
-      if (version === revision && approvalVersion === approvalRevision && !pendingApprovalMode()) {
-        revision++;
+      if (version === revision && !pendingApprovalMode()) {
         preserveScroll(() => {
           run = value;
           paintTurn(value);
+          showApprovalMode();
           showRunControls();
         });
       }
     } catch (error) {
-      if (version === revision) notice(error.message);
+      conversationNotice(origin, error.message);
     } finally {
-      acting = null;
-      preserveScroll(showRunControls);
-      void refresh();
+      actions.delete(id);
+      if (conversation === origin) {
+        revision++;
+        preserveScroll(showRunControls);
+      }
+      refresh();
     }
   });
 }
@@ -1304,7 +1575,11 @@ function closeSidebar() {
 }
 $("sidebar-scrim").addEventListener("click", closeSidebar);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !$("model-dialog").open && !$("file-dialog").open && $("sidebar").classList.contains("open")) {
+  if (event.key !== "Escape" || $("model-dialog").open) return;
+  if (filePreview) {
+    event.preventDefault();
+    closeFilePanel();
+  } else if ($("sidebar").classList.contains("open")) {
     closeSidebar();
   }
 });
@@ -1319,24 +1594,21 @@ $("example").addEventListener("click", () => {
   $("task").focus();
 });
 $("approval-mode").addEventListener("change", () => {
-  approvalTouched = true;
-  approvalHint();
   const mode = $("approval-mode").value;
+  conversation.approvalMode = mode;
+  approvalHint();
   const submission = pendingSubmission();
   if (submission) submission.approvalMode = mode;
-  else if (active.has(run?.status)) void updateApprovalMode(run.id, mode);
+  else if (active.has(run?.status)) void updateApprovalMode(conversation, run.id, mode);
 });
-$("worker").addEventListener("change", () => {
-  workerTouched = true;
-  updateSendControl();
-});
+$("worker").addEventListener("change", updateSendControl);
 $("attach").addEventListener("click", () => $("attachment-input").click());
 $("attachment-input").addEventListener("change", (event) => {
   const input = event.target;
   const picked = Array.from(input.files);
   input.value = "";
-  if (!picked.length || submitting?.origin === draftKey()) return;
-  const next = [...draftFiles, ...picked.map((file) => ({ file }))];
+  if (!picked.length || pendingSubmission()) return;
+  const next = [...conversation.files, ...picked.map((file) => ({ file }))];
   const tooLarge = picked.find((file) => file.size > attachmentLimits.file);
   let error = "";
   if (tooLarge) error = tooLarge.name + " 超过单个附件 20 MB 的限制。";
@@ -1347,15 +1619,20 @@ $("attachment-input").addEventListener("change", (event) => {
   preserveScroll(() => {
     attachmentError(error);
     if (!error) {
-      draftFiles = next;
+      conversation.files = next;
       showDraftFiles();
     }
   });
   updateSendControl();
 });
-$("close-file").addEventListener("click", () => $("file-dialog").close());
-$("file-dialog").addEventListener("close", () => {
-  if (!$("file-dialog").open) clearFilePreview();
+$("close-file").addEventListener("click", () => closeFilePanel());
+$("file-panel-scrim").addEventListener("click", () => closeFilePanel());
+filePanelOverlay.addEventListener("change", syncFilePanelMode);
+$("file-version").addEventListener("change", (event) => {
+  const preview = filePreview;
+  if (!preview) return;
+  const file = preview.versions[Number(event.target.value)];
+  if (file) void showFile(file, preview.runId, preview.trigger, preview);
 });
 $("download-file").addEventListener("click", async (event) => {
   const preview = filePreview;
@@ -1364,7 +1641,7 @@ $("download-file").addEventListener("click", async (event) => {
   button.disabled = true;
   $("file-download-error").hidden = true;
   try {
-    const data = await fileData(preview);
+    const data = preview.data || await fileData(preview);
     if (filePreview !== preview) return;
     const url = URL.createObjectURL(data.slice(0, data.size, "application/octet-stream"));
     const link = element("a");

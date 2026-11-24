@@ -20,13 +20,13 @@ Mini Harness 采用单工具架构。一个 Agent Loop 统一推理、执行和�
 mini-harness local
 ```
 
-打开 [本地 Web UI](http://127.0.0.1:8000/) 并配置模型。本地启动器会启动桌面和云端浏览器两个 Worker。操作 macOS 当前桌面时，需为启动进程的应用授予屏幕录制与辅助功能权限。Ctrl+C 停止服务和两个 Worker。
+打开 [本地 Web UI](http://127.0.0.1:8000/) 并配置模型。本地启动器会启动一个桌面 Worker 和三个云端浏览器 Worker。操作 macOS 当前桌面时，需为启动进程的应用授予屏幕录制与辅助功能权限。Ctrl+C 停止服务和所有 Worker。
 
-输入框下方默认选「桌面」，用于操作当前桌面和原生应用，点击和输入会使用实际鼠标或键盘。选择「云端浏览器」后，下一轮会在独立的 Chromium 会话里完成网页操作。每轮浏览器使用独立的标签页和登录状态，下载和上传使用该轮的工作目录。云端浏览器在本地启动时优先使用本机安装的 Chrome，也可用 `python -m playwright install chromium` 安装 Chromium，或通过 `MINI_CLOUD_BROWSER_EXECUTABLE` 指定浏览器。审批卡和运行轨迹会显示操作目标。
+输入框下方默认使用「自动选择」，优先使用空闲的桌面 Worker，也可在桌面忙碌或离线时使用空闲的云端浏览器 Worker。可手动指定环境，也可随时切回「自动选择」。桌面操作使用实际鼠标和键盘，每台桌面同时供一个对话使用。云端浏览器每轮使用独立的 Chromium 会话和工作目录。本地浏览器优先使用本机安装的 Chrome，也可用 `python -m playwright install chromium` 安装 Chromium，或通过 `MINI_CLOUD_BROWSER_EXECUTABLE` 指定浏览器。审批卡和运行轨迹会显示操作目标。
 
 ## 在无桌面的服务器上启动
 
-Docker Compose 会启动浏览器 Worker。复制 `.env.example` 为 `.env`，填入 API 和 Worker 密钥及支持 OpenAI Chat Completions 工具调用与图片输入的模型配置。
+Docker Compose 会启动三个独立的浏览器 Worker。复制 `.env.example` 为 `.env`，填入 API 和 Worker 密钥及支持 OpenAI Chat Completions 工具调用与图片输入的模型配置。
 
 ```bash
 docker compose up --build
@@ -43,13 +43,13 @@ mini-harness run '打开 https://example.com，截图并告诉我页面标题。
 mini-harness trace RUN_ID
 ```
 
-自动选择优先使用桌面 Worker。服务尚未识别到启用了桌面控制的 Worker 时，才会自动选择浏览器 Worker。如果已知的桌面 Worker 都忙碌或离线，任务会暂停，待桌面可用后可用 `mini-harness resume RUN_ID` 继续。使用 `--worker WORKER_ID` 可指定节点，使用 `--session SESSION_ID` 可延续会话。已经绑定的 Run 需要原 Worker 和原工作区。如果 Worker 进程重启并丢失工作区，请启动新 Run。断线发生在操作发出之后时，轨迹会记录结果未知，Agent 可以先观察再决定下一步。用 `mini-harness cancel RUN_ID` 取消并释放节点。
+CLI 自动选择优先使用桌面 Worker。服务尚未识别到启用了桌面控制的 Worker 时，才会自动选择浏览器 Worker。如果已知的桌面 Worker 都忙碌或离线，任务会暂停，待桌面可用后可用 `mini-harness resume RUN_ID` 继续。使用 `--worker WORKER_ID` 可指定节点，使用 `--session SESSION_ID` 可延续会话。已经绑定的 Run 需要原 Worker 和原工作区。如果 Worker 进程重启并丢失工作区，请启动新 Run。断线发生在操作发出之后时，轨迹会记录结果未知，Agent 可以先观察再决定下一步。用 `mini-harness cancel RUN_ID` 取消并释放节点。
 
 `mini-harness run` 默认使用自动审批，可用 `--approval-mode manual` 或 `--approval-mode allow` 切换模式。`--wait` 遇到待审批操作时会返回 Run ID 和操作详情。用 `mini-harness approve RUN_ID CALL_ID allow` 放行，或用 `deny` 拒绝。通过 `mini-harness status RUN_ID` 查看后续状态。
 
 Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromium 浏览器上下文。下载路径和上传文件都相对于该目录。任务文件随 Run 关闭而清理，截图和工具轨迹保存在服务端。容器是云端的隔离边界。共享一个 Worker 容器的任务应属于同一信任域。部署时，将 Worker 与内网服务和宿主机敏感资源隔开。对不可信任务使用独立的 Worker 容器，并保留 Bash 审批。
 
-也可以单独运行 `mini-harness serve` 和 `python -m workers.cloud` 来开发与测试。先安装 `python -m pip install -e '.[cloud]'`，再运行 `python -m playwright install chromium`。开发用 Worker 进程会以当前账号运行，其 Bash 拥有该账号的权限。
+也可以单独运行 `mini-harness serve` 和 `python -m workers.cloud` 来开发与测试。先安装 `python -m pip install -e '.[cloud]'`，再运行 `python -m playwright install chromium`。为每个浏览器 Worker 设置不同的 `MINI_WORKER_ID`，即可增加并行容量。开发用 Worker 进程会以当前账号运行，其 Bash 拥有该账号的权限。
 
 ## 连接本地桌面
 
@@ -108,10 +108,10 @@ harness computer scroll down 500
 ## API 与验收
 
 用 `mini-harness serve` 在本机启动后，直接打开 [本地 Web UI](http://127.0.0.1:8000/)。
-首次运行时在「模型设置」中填写 OpenAI 兼容的 Base URL、模型名及服务需要的 API Key。
-设置保存在 `HARNESS_DATA_DIR/model.json`，下次启动会优先使用已保存的配置；未保存时使用环境变量。
+首次运行时在「模型设置」中填写供应商名称、OpenAI 兼容的 Base URL、模型名及服务需要的 API Key。可以保存多组供应商配置，并随时启用其中一组；启用后，后续模型请求（包括进行中任务的下一次请求）使用该配置。
+设置保存在 `HARNESS_DATA_DIR/model.json`，下次启动会优先使用已保存的配置；未保存时使用环境变量。已有的单模型配置会自动保留为一组供应商配置。
 免 Token 连接只用于直接访问本机回环地址的浏览器页面，CLI 和外部 API 客户端仍使用 `HARNESS_API_TOKEN`。
-侧栏显示最近 100 个对话，包括通过 CLI 创建的会话。选中对话后可连续发送消息，点击「新建对话」可开始独立会话。
+侧栏显示最近 100 个对话及其运行状态，包括通过 CLI 创建的会话。对话运行时可点击「新建对话」开始另一条任务，也可以从侧栏切回查看回复和审批。每个对话在当前轮结束后可继续发送消息。
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。
 Harness 以流式方式向模型请求回复。模型返回的思考过程和正文会随生成进度显示，工具调用收齐后再审批和执行。模型请求的读取超时为 15 分钟，在等待下一段数据时计时。
 后续消息会携带此前已完成、失败或取消运行的事件记录，模型回复按合并后的完整消息回传。历史截图以轨迹中的附件引用保留，不会重新作为图片发送给模型；每次运行使用新的工作区和浏览器上下文。长对话可能超过模型服务的上下文限制。
@@ -122,7 +122,7 @@ Harness 以流式方式向模型请求回复。模型返回的思考过程和正
 
 Agent 可以通过 Bash 执行 `harness view`，主动查看工作区内的文件。例如用 Playwright 生成 `preview.png`，再执行 `harness view preview.png`，模型就可以检查实际渲染效果。`harness view --help` 列出页面、工作表、视频帧和图像裁剪等选项。用 `harness register <文件路径>` 将原件交付给用户。两条命令在 Bash 调用结束时读取文件，并沿用现有的 Bash 审批模式。
 
-每轮对话显示已上传的文件，以及运行生成的预览和显式交付的文件。图片和文本可在页面中预览，其他原件可以下载。已登记文件随服务数据目录保留。PDF 预览需要 Poppler，SVG 渲染需要 `rsvg-convert`，Word 和 PowerPoint 的页面渲染需要在 Worker 上安装 LibreOffice，媒体预览需要 FFmpeg。模型视觉预览需要支持图像输入的 OpenAI 兼容模型。
+每轮对话把运行产物分为交付文件和运行预览。点击产物、附件或轨迹截图可打开右侧文件面板，预览图片或文本并下载原件。产物卡片显示同一路径的最新版本，可在面板里切换历史版本。已登记文件随服务数据目录保留。PDF 预览需要 Poppler，SVG 渲染需要 `rsvg-convert`，Word 和 PowerPoint 的页面渲染需要在 Worker 上安装 LibreOffice，媒体预览需要 FFmpeg。模型视觉预览需要支持图像输入的 OpenAI 兼容模型。
 
 API 客户端可向 `POST /v1/uploads` 发送 `application/octet-stream` 原始文件，在 `X-File-Name` 中提供 URL 编码后的文件名，并将返回的 ID 作为 `upload_ids` 传给 `POST /v1/runs`。运行的文件列表和下载地址分别为 `GET /v1/runs/{id}/files` 和 `GET /v1/runs/{id}/files/{file_id}`。
 
@@ -134,7 +134,7 @@ API 客户端可向 `POST /v1/uploads` 发送 `application/octet-stream` 原始�
 
 在单一信任域中，可以设置 `HARNESS_TRUST_CLOUD_BASH=1`，让隔离的浏览器 Worker 在自动审批模式中运行任意 Bash 命令。
 
-FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为；未结束的 Run 可以用 `PATCH /v1/runs/{id}/approval-mode` 更改。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
+FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。创建 Run 时可用 `worker_id` 指定节点，或用 `worker_target` 选择 `desktop`、`browser`、`auto`。`auto` 优先空闲桌面，其次空闲浏览器。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为。未结束的 Run 可以用 `PATCH /v1/runs/{id}/approval-mode` 更改。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
 
 ```bash
 python -m pip install -e '.[cloud]'

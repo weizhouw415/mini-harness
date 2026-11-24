@@ -19,14 +19,14 @@ services:
     cap_drop:
       - ALL
 
-  cloud-worker:
+  cloud-worker: &cloud-worker
     build:
       context: .
       dockerfile: workers/cloud/Dockerfile
     init: true
     depends_on:
       - server
-    environment:
+    environment: &cloud-worker-environment
       MINI_WORKER_URL: ws://server:8000/v1/workers/ws
       MINI_WORKER_ALLOW_INSECURE: "1"
       MINI_WORKER_ID: cloud
@@ -44,6 +44,18 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+  cloud-worker-2:
+    <<: *cloud-worker
+    environment:
+      <<: *cloud-worker-environment
+      MINI_WORKER_ID: cloud-2
+
+  cloud-worker-3:
+    <<: *cloud-worker
+    environment:
+      <<: *cloud-worker-environment
+      MINI_WORKER_ID: cloud-3
 
 volumes:
   data:

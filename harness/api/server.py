@@ -20,7 +20,7 @@ from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOADS, file_name
 from harness.config import ModelConfig, Settings
 from harness.core.agent import Agent
 from harness.core.llm import ModelError, OpenAICompatible
-from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
+from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerTarget, WorkerUnavailable
 from harness.skills import SkillError, SkillStore, evaluate_skill, learn_skill
 from harness.storage.sqlite import Conflict, NotFound, RunStore
 
@@ -29,6 +29,7 @@ class RunRequest(BaseModel):
     task: str = Field(default="", max_length=16_000)
     session_id: str | None = None
     worker_id: str | None = None
+    worker_target: WorkerTarget | None = None
     approval_mode: Literal["manual", "auto", "allow"] | None = None
     upload_ids: list[Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]] = Field(
         default_factory=list, max_length=MAX_UPLOADS,
@@ -48,6 +49,10 @@ class ModelRequest(BaseModel):
     model: str = Field(max_length=256)
     base_url: str = Field(max_length=2048)
     api_key: str | None = Field(default=None, max_length=8192)
+
+
+class ProviderRequest(ModelRequest):
+    name: str = Field(max_length=256)
 
 
 class ChatMessage(BaseModel):
@@ -188,16 +193,20 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
             "base_url": config["base_url"], "has_api_key": bool(config["api_key"]),
         }, headers={"Cache-Control": "no-store"})
 
-    @app.get("/ui/model", include_in_schema=False)
-    async def read_model(request: Request):
-        if not is_local_ui(request):
-            raise HTTPException(403, "Open the Web UI on the local server's loopback address.")
-        return model_status()
+    def providers_status():
+        return JSONResponse({
+            "providers": [{"id": p["id"], "name": p["name"], "model": p["model"],
+                           "base_url": p["base_url"], "has_api_key": bool(p["api_key"])}
+                          for p in model_config.providers],
+            "active_provider_id": model_config.active_provider_id,
+            "configured": bool(model_config.values["model"]),
+        }, headers={"Cache-Control": "no-store"})
 
-    @app.put("/ui/model", include_in_schema=False)
-    async def write_model(request: Request, config: ModelRequest):
+    def require_local_model_access(request: Request):
         if not is_local_ui(request):
             raise HTTPException(403, "Open the Web UI on the local server's loopback address.")
+
+    def validate_model(config: ModelRequest):
         model, base_url = config.model.strip(), config.base_url.strip().rstrip("/")
         try:
             url = httpx.URL(base_url)
@@ -209,8 +218,66 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
             raise HTTPException(422, "Enter a model name and a valid HTTP(S) Base URL without credentials or query.")
         if config.api_key is not None and any(not 33 <= ord(c) <= 126 for c in config.api_key):
             raise HTTPException(422, "The API key must contain only printable ASCII characters without spaces.")
+        return model, base_url
+
+    def validate_provider(config: ProviderRequest):
+        name = config.name.strip()
+        if not name:
+            raise HTTPException(422, "Enter a provider name.")
+        model, base_url = validate_model(config)
+        return name, model, base_url
+
+    def require_provider(provider_id: str):
+        if model_config.provider(provider_id) is None:
+            raise HTTPException(404, "Provider not found.")
+
+    @app.get("/ui/model", include_in_schema=False)
+    async def read_model(request: Request):
+        require_local_model_access(request)
+        return model_status()
+
+    @app.put("/ui/model", include_in_schema=False)
+    async def write_model(request: Request, config: ModelRequest):
+        require_local_model_access(request)
+        model, base_url = validate_model(config)
         model_config.save(model, base_url, config.api_key)
         return model_status()
+
+    @app.get("/ui/providers", include_in_schema=False)
+    async def read_providers(request: Request):
+        require_local_model_access(request)
+        return providers_status()
+
+    @app.post("/ui/providers", status_code=201, include_in_schema=False)
+    async def create_provider(request: Request, config: ProviderRequest):
+        require_local_model_access(request)
+        name, model, base_url = validate_provider(config)
+        model_config.create(name, model, base_url, config.api_key)
+        response = providers_status()
+        response.status_code = 201
+        return response
+
+    @app.put("/ui/providers/{provider_id}", include_in_schema=False)
+    async def update_provider(request: Request, provider_id: str, config: ProviderRequest):
+        require_local_model_access(request)
+        require_provider(provider_id)
+        name, model, base_url = validate_provider(config)
+        model_config.update(provider_id, name, model, base_url, config.api_key)
+        return providers_status()
+
+    @app.put("/ui/providers/{provider_id}/activate", include_in_schema=False)
+    async def activate_provider(request: Request, provider_id: str):
+        require_local_model_access(request)
+        require_provider(provider_id)
+        model_config.activate(provider_id)
+        return providers_status()
+
+    @app.delete("/ui/providers/{provider_id}", include_in_schema=False)
+    async def delete_provider(request: Request, provider_id: str):
+        require_local_model_access(request)
+        require_provider(provider_id)
+        model_config.delete(provider_id)
+        return providers_status()
 
     @app.get("/ui/{asset}", include_in_schema=False)
     async def web_asset(asset: Literal["app.js", "style.css", "markdown.js", "markdown.css",
@@ -244,19 +311,22 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
 
     def start(task: str, session_id: str | None, worker_id: str | None,
               approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy",
-              upload_ids: list[str] | None = None):
+              upload_ids: list[str] | None = None, *, worker_target: WorkerTarget | None = None):
         if upload_ids and not task.strip():
             task = "请查看我上传的附件。"
         if not task.strip() or len(task) > 16_000:
             raise HTTPException(422, "The task must contain 1 to 16000 characters.")
-        run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids)
+        if worker_id is not None and worker_target is not None:
+            raise HTTPException(422, "Specify either worker_id or worker_target.")
+        run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids,
+                           worker_target=worker_target)
         agent.schedule(run["id"])
         return store.get(run["id"], include_files=True)
 
     @app.post("/v1/runs", status_code=202, dependencies=control)
     async def start_run(request: RunRequest):
         return start(request.task, request.session_id, request.worker_id, request.approval_mode or "legacy",
-                     request.upload_ids)
+                     request.upload_ids, worker_target=request.worker_target)
 
     @app.get("/v1/runs", dependencies=control)
     async def list_runs():

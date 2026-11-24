@@ -44,7 +44,7 @@ def main(*, headless: bool = False):
     worker_env = env.copy()
     worker_env["MINI_WORKER_SECRET"] = worker_env.pop("HARNESS_WORKER_SECRET")
     worker_env.pop("HARNESS_API_TOKEN", None)
-    browser_env = {**worker_env, "MINI_WORKER_ID": "cloud"}
+    browser_env = worker_env.copy()
     if not browser_env.get("MINI_CLOUD_BROWSER_EXECUTABLE"):
         if chrome := _chrome_executable(browser_env):
             browser_env["MINI_CLOUD_BROWSER_EXECUTABLE"] = chrome
@@ -71,7 +71,10 @@ def main(*, headless: bool = False):
         if desktop:
             desktop_env = {**worker_env, "MINI_WORKER_ID": "desktop", "MINI_DESKTOP_CONTROL": "1"}
             children.append(subprocess.Popen([sys.executable, "-m", "workers.desktop"], env=desktop_env))
-        children.append(subprocess.Popen([sys.executable, "-m", "workers.cloud"], env=browser_env))
+        for worker_id in ("cloud", "cloud-2", "cloud-3"):
+            children.append(subprocess.Popen(
+                [sys.executable, "-m", "workers.cloud"], env={**browser_env, "MINI_WORKER_ID": worker_id},
+            ))
         print("Mini Harness is starting at http://127.0.0.1:8000/ (Ctrl+C to stop)", flush=True)
         while not stopping:
             for child in children:

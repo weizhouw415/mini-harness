@@ -44,6 +44,7 @@ class RunStore:
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES sessions(id),
                     requested_worker TEXT,
+                    worker_target TEXT CHECK(worker_target IN ('auto', 'browser', 'desktop')),
                     worker_id TEXT,
                     workspace_id TEXT NOT NULL,
                     task TEXT NOT NULL,
@@ -83,10 +84,16 @@ class RunStore:
                 CREATE INDEX IF NOT EXISTS run_file_paths ON run_files(run_id, source, path, version);
             """)
             db.execute("BEGIN IMMEDIATE")
-            if "approval_mode" not in {row["name"] for row in db.execute("PRAGMA table_info(runs)")}:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+            if "approval_mode" not in columns:
                 db.execute("""
                     ALTER TABLE runs ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'legacy'
                         CHECK(approval_mode IN ('legacy', 'manual', 'auto', 'allow'))
+                """)
+            if "worker_target" not in columns:
+                db.execute("""
+                    ALTER TABLE runs ADD COLUMN worker_target TEXT
+                        CHECK(worker_target IN ('auto', 'browser', 'desktop'))
                 """)
 
     @contextmanager
@@ -101,7 +108,8 @@ class RunStore:
             db.close()
 
     def create(self, task: str, session_id: str | None, worker_id: str | None,
-               approval_mode: ApprovalMode = "legacy", *, upload_ids: list[str] | None = None) -> dict:
+               approval_mode: ApprovalMode = "legacy", *, upload_ids: list[str] | None = None,
+               worker_target: str | None = None) -> dict:
         run_id, workspace_id = uuid4().hex, uuid4().hex
         created = now()
         upload_ids = upload_ids or []
@@ -130,9 +138,9 @@ class RunStore:
                 raise NotFound("Session not found.")
             try:
                 db.execute(
-                    """INSERT INTO runs (id, session_id, requested_worker, workspace_id, task,
-                       status, approval_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
-                    (run_id, session_id, worker_id, workspace_id, task, approval_mode, created, created),
+                    """INSERT INTO runs (id, session_id, requested_worker, worker_target, workspace_id, task,
+                       status, approval_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                    (run_id, session_id, worker_id, worker_target, workspace_id, task, approval_mode, created, created),
                 )
             except sqlite3.IntegrityError as error:
                 raise Conflict("This session already has an unfinished run.") from error
