@@ -64,7 +64,7 @@ class WorkerBackend:
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
             "safe_bash_path": True, "skill_workspace": self.bash_enabled and self.desktop_enabled,
-            "artifact_workspace": self.desktop_enabled,
+            "artifact_workspace": self.desktop_enabled, "cli_capability_toggles": True,
             "computer": self.desktop_enabled, "computer_cli": self.desktop_enabled,
             "download": False, "upload": False,
             "actions": actions, "computer_targets": {"desktop": actions},
@@ -368,7 +368,8 @@ class WorkerBackend:
         while not self.pause_file.exists():
             await asyncio.sleep(0.2)
 
-    async def bash(self, run_id: str, command: str, timeout: float) -> dict:
+    async def bash(self, run_id: str, command: str, timeout: float, *,
+                   cli_capabilities: dict[str, bool] | None = None) -> dict:
         if not self.bash_enabled:
             raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
         run = self._get_run(run_id)
@@ -376,8 +377,9 @@ class WorkerBackend:
             self.check_available()
             if run.closed:
                 raise ValueError("Run is closed")
-            context = (contextlib.nullcontext(("", None)) if is_safe_bash(command)
-                       else artifact_requests(run.path))
+            context = (contextlib.nullcontext(("", None)) if (is_safe_bash(command) or
+                           (cli_capabilities is not None and not any(cli_capabilities.values())))
+                       else artifact_requests(run.path, cli_capabilities))
             with context as (setup, channel):
                 arguments = await self._bash_arguments(run.path, setup + command)
                 self.check_available()
@@ -389,7 +391,7 @@ class WorkerBackend:
                     completed, _ = await asyncio.wait({shell, pause}, return_when=asyncio.FIRST_COMPLETED)
                     if pause in completed:
                         raise PermissionError("Desktop worker was paused while Bash was running")
-                    result = await add_artifact_content(shell.result(), run.path, channel)
+                    result = await add_artifact_content(shell.result(), run.path, channel, cli_capabilities)
                     self.check_available()
                     return result
                 finally:

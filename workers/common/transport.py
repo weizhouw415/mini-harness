@@ -127,8 +127,17 @@ class _Runtime:
                     raise ValueError("Bash requires a command")
                 if type(timeout) is not int or not 1 <= timeout <= 3600:
                     raise ValueError("Bash timeout must be between 1 and 3600 seconds")
+                cli_capabilities = params.get("cli_capabilities")
+                if cli_capabilities is not None and (
+                    not isinstance(cli_capabilities, dict)
+                    or set(cli_capabilities) != {"view", "register", "computer_use"}
+                    or any(type(value) is not bool for value in cli_capabilities.values())
+                ):
+                    raise ValueError("Invalid CLI capability settings")
                 self.call_ids.add(call_id)
-                return await self.backend.bash(run_id, command, timeout)
+                if cli_capabilities is None:
+                    return await self.backend.bash(run_id, command, timeout)
+                return await self.backend.bash(run_id, command, timeout, cli_capabilities=cli_capabilities)
             if method in {"computer.execute", "computer.cli"}:
                 action = params.get("action")
                 if not isinstance(action, dict):

@@ -24,7 +24,7 @@
       <span id="connection"><i></i> 未连接</span>
       <button id="settings" type="button">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><path d="M9 4v4m6 2v4m-6 2v4"/></svg>
-        模型设置
+        设置
       </button>
     </footer>
   </aside>
@@ -154,13 +154,15 @@
     </div>
   </aside>
   <dialog id="model-dialog" aria-labelledby="model-dialog-title">
-    <h2 id="model-dialog-title">模型设置</h2>
+    <h2 id="model-dialog-title">设置</h2>
     <div id="provider-list-view">
+      <h3>模型供应商</h3>
       <p class="provider-intro">保存多个模型供应商，随时切换当前使用的配置。</p>
       <p class="provider-intro">启用、修改或删除当前配置会影响进行中任务的后续模型请求。</p>
       <div id="provider-list" aria-live="polite"></div>
       <div class="dialog-actions">
         <button id="close-settings" type="button">关闭</button>
+        <button id="open-capabilities" type="button">能力设置</button>
         <button id="add-provider" class="primary" type="button">添加供应商</button>
       </div>
     </div>
@@ -178,6 +180,26 @@
       <input id="model-name" required maxlength="256" placeholder="模型 ID">
       <div class="dialog-actions">
         <button id="cancel-provider" type="button">返回</button>
+        <button class="primary" type="submit">保存</button>
+      </div>
+    </form>
+    <form id="capabilities-form" hidden>
+      <h3>能力设置</h3>
+      <p class="capability-intro">Bash 始终可用。能力设置仅影响之后启动的任务。</p>
+      <label class="capability-option" for="capability-view">
+        <span><strong>文件预览</strong><small>通过 harness view 查看文件和图像预览。</small></span>
+        <input id="capability-view" type="checkbox" role="switch">
+      </label>
+      <label class="capability-option" for="capability-register">
+        <span><strong>交付文件</strong><small>通过 harness register 将文件提供给用户下载。</small></span>
+        <input id="capability-register" type="checkbox" role="switch">
+      </label>
+      <label class="capability-option" for="capability-computer-use">
+        <span><strong>界面操作</strong><small>通过 harness computer 观察和操作浏览器或桌面。</small></span>
+        <input id="capability-computer-use" type="checkbox" role="switch">
+      </label>
+      <div class="dialog-actions">
+        <button id="cancel-capabilities" type="button">返回</button>
         <button class="primary" type="submit">保存</button>
       </div>
     </form>

@@ -429,11 +429,13 @@ class WorkerManager:
         return worker
 
     async def bash(
-        self, worker_id: str, run_id: str, call_id: str, command: str, timeout: int
+        self, worker_id: str, run_id: str, call_id: str, command: str, timeout: int, *,
+        cli_capabilities: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
         return await self._get_worker(worker_id, run_id).request(
             call_id, "bash.execute",
-            {"run_id": run_id, "command": command, "timeout": timeout},
+            {"run_id": run_id, "command": command, "timeout": timeout,
+             **({"cli_capabilities": cli_capabilities} if cli_capabilities is not None else {})},
             timeout + 15,
         )
 

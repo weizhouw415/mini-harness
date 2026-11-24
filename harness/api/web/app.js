@@ -86,6 +86,31 @@ function conversationNotice(origin, message = "", source = "") {
   if (origin === conversation) notice(message, source);
 }
 
+function requestErrorMessage(path, status, data) {
+  data = data && typeof data === "object" ? data : {};
+  const details = Array.isArray(data.detail) ? data.detail : [];
+  const oldAssetRoute = details.some((item) =>
+    Array.isArray(item.loc) && item.loc[0] === "path" && item.loc[1] === "asset");
+  if (["/ui/providers", "/ui/capabilities"].includes(path) &&
+      (status === 404 || (status === 422 && oldAssetRoute))) {
+    return "页面与服务端版本不一致。请先处理进行中或暂停的任务，再重启 Mini Harness 并刷新页面。";
+  }
+  if (typeof data.detail === "string") return data.detail;
+  if (status === 422 && details.length) {
+    // Only show known field names and fixed messages, never server-provided input values.
+    const fields = new Set(["name", "model", "base_url", "api_key", "view", "register", "computer_use",
+      "task", "worker_id", "worker_target", "approval_mode", "session_id", "upload_ids", "command", "timeout"]);
+    const field = (Array.isArray(details[0].loc) ? details[0].loc : []).find((part) => fields.has(part));
+    const kind = String(details[0].type || "");
+    const reason = kind === "missing" ? "缺少必填内容" :
+      kind.includes("too_long") ? "内容过长" :
+      kind.includes("bool") ? "需要布尔值" :
+      kind === "extra_forbidden" ? "包含不支持的字段" : "内容不符合要求";
+    return "请求参数无效" + (field ? "（" + field + "）" : "") + "：" + reason + "。";
+  }
+  return "请求失败 (" + status + ")";
+}
+
 async function request(path, { method = "GET", body, extraHeaders, timeout = 12000 } = {}) {
   const headers = { "X-Harness-UI": "1", ...extraHeaders };
   if (body !== undefined && !(body instanceof Blob)) {
@@ -97,7 +122,7 @@ async function request(path, { method = "GET", body, extraHeaders, timeout = 120
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    const message = typeof data.detail === "string" ? data.detail : "请求失败 (" + response.status + ")";
+    const message = requestErrorMessage(path, response.status, data);
     throw Object.assign(new Error(message), { status: response.status });
   }
   return response;
@@ -948,6 +973,8 @@ function appendEvents(view, events, id) {
       if (!data.calls?.length) view.finalUpdate = generation.update?.entry;
     } else if (type === "worker_bound") {
       addTraceEntry(view, "screen", "已连接 Worker", data.worker_id, event.created_at);
+    } else if (type === "model_compatibility" && data.reasoning_effort === "none") {
+      addTraceEntry(view, "activity", "模型兼容模式", "该模型通过 Chat Completions 调用工具时已自动关闭推理。", event.created_at);
     } else if (data.call_id && traceCallEvents.has(type)) {
       recordTraceCall(view, event, id);
       if (type === "tool_call") {
@@ -1311,6 +1338,7 @@ function modelError(message = "") {
 function showProviderList() {
   $("api-key").value = "";
   $("model-form").hidden = true;
+  $("capabilities-form").hidden = true;
   $("provider-list-view").hidden = false;
   modelError();
   const list = $("provider-list");
@@ -1405,6 +1433,47 @@ async function openSettings(onlyIfMissing = false) {
 
 $("add-provider").addEventListener("click", () => editProvider());
 $("cancel-provider").addEventListener("click", showProviderList);
+$("open-capabilities").addEventListener("click", async () => {
+  const button = $("open-capabilities");
+  button.disabled = true;
+  modelError();
+  try {
+    const capabilities = await api("/ui/capabilities");
+    $("capability-view").checked = capabilities.view;
+    $("capability-register").checked = capabilities.register;
+    $("capability-computer-use").checked = capabilities.computer_use;
+    $("provider-list-view").hidden = true;
+    $("capabilities-form").hidden = false;
+    $("capability-view").focus();
+  } catch (error) {
+    modelError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+$("cancel-capabilities").addEventListener("click", showProviderList);
+$("capabilities-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = $("capabilities-form").querySelector("[type=submit]");
+  submit.disabled = true;
+  modelError();
+  try {
+    await api("/ui/capabilities", {
+      method: "PUT",
+      body: {
+        view: $("capability-view").checked,
+        register: $("capability-register").checked,
+        computer_use: $("capability-computer-use").checked,
+      },
+    });
+    showProviderList();
+    notice();
+  } catch (error) {
+    modelError(error.message);
+  } finally {
+    submit.disabled = false;
+  }
+});
 $("model-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("model-form").querySelector("[type=submit]");

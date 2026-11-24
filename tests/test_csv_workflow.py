@@ -278,6 +278,7 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 llm_base_url=f"http://{address}/provider/v1",
                 llm_api_key=PROVIDER_TOKEN,
                 trust_cloud_bash=True,
+                skill_review_interval=0,
             )
 
             async def evaluator(skill, environment):
@@ -342,16 +343,14 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 artifact = (await client.get(f"/v1/runs/{first_run['id']}/artifacts/{screenshot}")).raise_for_status()
                 self.assertTrue(artifact.content.startswith(b"\x89PNG\r\n\x1a\n"))
 
-                candidate = (await client.post(f"/v1/runs/{first_run['id']}/learn")).raise_for_status().json()
-                self.assertEqual(candidate["state"], "candidate")
-                skill_url = f"/v1/skills/{candidate['name']}/{candidate['version']}"
+                learned = (await client.post(f"/v1/runs/{first_run['id']}/learn")).raise_for_status().json()
+                self.assertEqual(learned["state"], "active")
+                skill_url = f"/v1/skills/{learned['name']}/{learned['version']}"
                 evaluation = (await client.post(
                     f"{skill_url}/evaluate", json={"environment": "cloud-browser"}
                 )).raise_for_status().json()
                 self.assertTrue(evaluation["evaluations"]["cloud-browser"]["passed"], evaluation)
                 self.assertEqual(held_out.uploads, [held_out.expected_rows])
-                published = (await client.post(f"{skill_url}/publish", json={"approved": True})).raise_for_status().json()
-                self.assertEqual(published["state"], "active")
 
                 await eventually(lambda: self.worker_is_ready(client, worker))
                 followup = await self.start_and_wait(client, CSV_FOLLOWUP, first_run["session_id"])
@@ -361,7 +360,7 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(model.saw_reusable_skill)
                 index = (await client.get("/v1/skills")).raise_for_status().json()
                 self.assertEqual({skill["version"]: skill["state"] for skill in index},
-                                 {"1.0.0": "active", "1.1.0": "candidate"})
+                                 {"1.0.0": "deprecated", "1.1.0": "active"})
                 await eventually(lambda: len(fixture.uploads) == 2)
                 self.assertEqual(fixture.login_count, 2)
 

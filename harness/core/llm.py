@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from io import StringIO
@@ -36,6 +37,18 @@ def _reasoning(delta: dict) -> str | None:
 def _error_detail(error: object) -> str:
     message = error.get("message") if isinstance(error, dict) else error
     return f" {message[:500]}" if isinstance(message, str) and message else ""
+
+
+def _requires_reasoning_none(error: object) -> bool:
+    """Recognize a provider's explicit remedy for tools with default reasoning enabled."""
+    message = error.get("message") if isinstance(error, dict) else error
+    if not isinstance(message, str):
+        return False
+    return bool(re.search(
+        r"function\s+tools\b.*?\breasoning_effort\b.*?\bnot\s+supported\b"
+        r".*?\bset\s+reasoning_effort\s+to\s+['\"]?none\b['\"]?",
+        message, re.IGNORECASE | re.DOTALL,
+    ))
 
 
 def _check_finish(reason: object) -> None:
@@ -256,25 +269,36 @@ class OpenAICompatible:
         try:
             timeout = httpx.Timeout(90, read=15 * 60)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    if not response.is_success:
-                        detail = ""
-                        try:
-                            error_payload = bytearray()
-                            async for chunk in response.aiter_bytes():
-                                if len(error_payload) + len(chunk) > 64 * 1024:
-                                    break
-                                error_payload.extend(chunk)
-                            body = json.loads(error_payload)
-                            if isinstance(body, dict):
-                                detail = _error_detail(body.get("error"))
-                        except (ValueError, httpx.RequestError):
-                            pass
-                        raise ModelError(f"Model service returned HTTP {response.status_code}.{detail}")
-                    content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-                    if content_type == "text/event-stream":
-                        return await _sse_reply(response, on_delta)
-                    return await _json_reply(response, on_delta)
+                for attempt in range(2):
+                    async with client.stream("POST", url, headers=headers, json=payload) as response:
+                        if not response.is_success:
+                            detail = ""
+                            provider_error = None
+                            try:
+                                error_payload = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    if len(error_payload) + len(chunk) > 64 * 1024:
+                                        break
+                                    error_payload.extend(chunk)
+                                body = json.loads(error_payload)
+                                if isinstance(body, dict):
+                                    provider_error = body.get("error")
+                                    detail = _error_detail(provider_error)
+                            except (ValueError, httpx.RequestError):
+                                pass
+                            if (attempt == 0 and tools and response.status_code == 400
+                                    and _requires_reasoning_none(provider_error)):
+                                payload["reasoning_effort"] = "none"
+                                continue
+                            raise ModelError(f"Model service returned HTTP {response.status_code}.{detail}")
+                        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                        if content_type == "text/event-stream":
+                            result = await _sse_reply(response, on_delta)
+                        else:
+                            result = await _json_reply(response, on_delta)
+                        if attempt:
+                            result["_compatibility"] = {"reasoning_effort": "none"}
+                        return result
         except httpx.RequestError as error:
             raise ModelError(f"Model request failed ({type(error).__name__}).") from error
         except (KeyError, IndexError, TypeError, ValueError) as error:

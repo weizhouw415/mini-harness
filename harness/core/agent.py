@@ -11,11 +11,13 @@ from harness.artifacts.files import MAX_PREVIEWS
 from harness.artifacts.preview import preview
 from harness.config import Settings
 from harness.core.approval import ApprovalDecision, decide_approval
-from harness.core.context import DEFAULT_BASH_TIMEOUT, TOOLS, build_messages
+from harness.core.context import DEFAULT_BASH_TIMEOUT, build_messages, build_tools
 from harness.core.llm import LLM, ModelError
 from harness.core.multimodal import artifact_block, persist_content
 from harness.execution.computer_cli import COMPUTER_HELP, parse_computer_command
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
+from harness.skills.commands import is_skill_command, run_skill_command
+from harness.skills.evolution import review_skills
 from harness.skills.loader import SkillError
 from harness.storage.sqlite import RunStore
 from workers.common.actions import GUI_ACTIONS, SCROLL_DIRECTIONS, point_fields, scroll_deltas, text_field
@@ -28,9 +30,12 @@ ASSISTANT_DELTA_INTERVAL = 0.15
 
 
 class Agent:
-    def __init__(self, settings: Settings, store: RunStore, workers: WorkerManager, skills, llm: LLM):
+    def __init__(self, settings: Settings, store: RunStore, workers: WorkerManager, skills, llm: LLM, *,
+                 capability_config=None):
         self.settings, self.store, self.workers, self.skills, self.llm = settings, store, workers, skills, llm
+        self.capability_config = capability_config
         self.tasks: dict[str, asyncio.Task] = {}
+        self.skill_reviews: set[asyncio.Task] = set()
 
     def schedule(self, run_id: str):
         current = self.tasks.get(run_id)
@@ -46,7 +51,7 @@ class Agent:
             self.schedule(run_id)
 
     async def stop(self):
-        tasks = list(self.tasks.values())
+        tasks = [*self.tasks.values(), *self.skill_reviews]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -97,6 +102,14 @@ class Agent:
 
     async def _loop(self, run: dict, capabilities: dict):
         run_id = run["id"]
+        snapshots = [event["data"] for event in self.store.events(run_id, include_deltas=False)
+                     if event["type"] == "capability_snapshot"]
+        enabled = snapshots[0] if snapshots else (dict(self.capability_config.values) if self.capability_config
+                                                  else {"view": True, "register": True, "computer_use": True})
+        if not snapshots:
+            self.store.event(run_id, "capability_snapshot", enabled)
+        if not all(enabled.values()) and capabilities.get("cli_capability_toggles") is not True:
+            raise WorkerCallError("This Worker cannot enforce CLI capability settings. Update the Worker and retry.")
         directory = self.store.directory / "artifacts" / run_id
         previous = self.store.previous(run["session_id"], run_id)
         await self._prepare_uploads(run, capabilities)
@@ -108,24 +121,54 @@ class Agent:
                 latest = turns[-1]
                 if not latest["calls"]:
                     candidate_event = await self._collect_skill_candidates(run, capabilities, events)
-                    self.store.transition(run_id, {"running"}, "completed", output=latest["message"]["content"],
-                                          event=candidate_event)
+                    output = latest["message"]["content"]
+                    self.store.transition(run_id, {"running"}, "completed", output=output, event=candidate_event)
+                    if not (candidate_event and candidate_event[1].get("accepted")):
+                        self._schedule_skill_review(run, capabilities.get("environment"), events, previous, output)
                     return
-                if not await self._deliver(run, capabilities, latest["calls"], events):
+                if not await self._deliver(run, capabilities, latest["calls"], events, enabled):
                     return
                 events = self.store.events(run_id, include_deltas=False)
             if len(turns) >= self.settings.max_steps:
                 raise ModelError("Maximum number of model steps reached.")
             messages = build_messages(run, capabilities, self.skills, previous, events, directory,
                                       self.settings.context_chars,
-                                      file_path=lambda identifier: self.store.run_file(run_id, identifier)[1])
-            await self._complete_turn(run_id, messages)
+                                      file_path=lambda identifier: self.store.run_file(run_id, identifier)[1],
+                                      cli_capabilities=enabled)
+            await self._complete_turn(run_id, messages, enabled)
 
-    async def _complete_turn(self, run_id: str, messages: list[dict]):
+    def _schedule_skill_review(self, run, environment, events, previous, output):
+        interval = self.settings.skill_review_interval
+        if not interval:
+            return
+        iterations = 0
+        for event in reversed(events):
+            if event["type"] == "tool_result" and event["data"]["result"].get("skill_changed"):
+                break
+            if event["type"] == "assistant" and event["data"]["calls"]:
+                iterations += 1
+        if iterations < interval:
+            return
+        trace = {**run, "status": "completed", "output": output, "events": events, "previous": previous}
+        task = asyncio.create_task(self._review_skills(run["id"], trace, environment),
+                                   name=f"skill-review-{run['id']}")
+        self.skill_reviews.add(task)
+        task.add_done_callback(self.skill_reviews.discard)
+
+    async def _review_skills(self, run_id, trace, environment):
+        try:
+            result = await review_skills(self.skills, trace, self.llm.complete, environment=environment)
+        except Exception:
+            logger.exception("Skill review failed for run %s", run_id)
+            result = {"status": "failed", "changes": []}
+        self.store.event(run_id, "skill_review", result)
+
+    async def _complete_turn(self, run_id: str, messages: list[dict], cli_capabilities: dict | None = None):
+        tools = build_tools(cli_capabilities)
         stream_complete = getattr(self.llm, "stream_complete", None)
         generation = {}
         if stream_complete is None:
-            reply = await self.llm.complete(messages, TOOLS)
+            reply = await self.llm.complete(messages, tools)
         else:
             generation = {"generation_id": uuid4().hex}
             loop = asyncio.get_running_loop()
@@ -154,11 +197,16 @@ class Agent:
                         scheduled = loop.call_later(delay, flush)
 
             try:
-                reply = await stream_complete(messages, TOOLS, on_delta=on_delta)
+                reply = await stream_complete(messages, tools, on_delta=on_delta)
             finally:
                 if scheduled is not None:
                     scheduled.cancel()
                 flush()
+        if reply.get("_compatibility") == {"reasoning_effort": "none"} and not any(
+            event["type"] == "model_compatibility" and event["data"].get("reasoning_effort") == "none"
+            for event in self.store.events(run_id, include_deltas=False)
+        ):
+            self.store.event(run_id, "model_compatibility", {"reasoning_effort": "none"})
         message, calls = self._normalize(reply)
         self.store.event(run_id, "assistant", {**generation, "message": message, "calls": calls,
                                                "usage": reply.get("_usage")})
@@ -216,7 +264,8 @@ class Agent:
     async def _collect_skill_candidates(self, run: dict, capabilities: dict, events: list[dict]):
         if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
             return None
-        if not any(event["type"] == "tool_call" and event["data"]["tool"] == "bash" for event in events):
+        if not any(event["type"] == "tool_call" and event["data"]["tool"] == "bash"
+                   and not event["data"].get("skill_command") for event in events):
             return None
         try:
             result = await self.workers.collect_skill_candidates(run["worker_id"], run["id"])
@@ -270,7 +319,8 @@ class Agent:
             raise ModelError("Model returned neither text nor tool calls.")
         return message, calls
 
-    async def _deliver(self, run: dict, capabilities: dict, calls: list[dict], events: list[dict]) -> bool:
+    async def _deliver(self, run: dict, capabilities: dict, calls: list[dict], events: list[dict],
+                       cli_capabilities: dict | None = None) -> bool:
         run_id, worker_id = run["id"], run["worker_id"]
         outcomes = {event["data"]["call_id"] for event in events if event["type"] == "tool_result"}
         started = {event["data"]["call_id"]: event["data"] for event in events if event["type"] == "tool_call"}
@@ -287,11 +337,16 @@ class Agent:
                 continue
             previous_request = requests.get(call_id)
             try:
-                event = self._dispatch_event(call, previous_request, capabilities)
+                event = self._dispatch_event(call, previous_request, capabilities, cli_capabilities)
             except ValueError as error:
                 self._result(run_id, call, {"error": str(error)})
                 continue
             tool, args = event["tool"], event["arguments"]
+            if event.get("skill_command"):
+                self.store.event(run_id, "tool_call", event)
+                result = run_skill_command(args["command"], self.skills, capabilities.get("environment"))
+                self._result(run_id, call, result, tool=tool)
+                continue
             if approvals.get(call_id) is False:
                 self._result(run_id, call, {"error": "The operator declined this action."}, tool=tool)
                 continue
@@ -320,7 +375,11 @@ class Agent:
                 if event.get("help"):
                     result = {"exit_code": 0, "stdout": COMPUTER_HELP, "stderr": ""}
                 elif tool == "bash":
-                    result = await self.workers.bash(worker_id, run_id, call_id, args["command"], args["timeout"])
+                    if cli_capabilities and not all(cli_capabilities.values()):
+                        result = await self.workers.bash(worker_id, run_id, call_id, args["command"], args["timeout"],
+                                                         cli_capabilities=cli_capabilities)
+                    else:
+                        result = await self.workers.bash(worker_id, run_id, call_id, args["command"], args["timeout"])
                 elif event.get("entrypoint") == "bash":
                     result = await self._computer_cli(worker_id, run_id, event, capabilities)
                 else:
@@ -333,9 +392,13 @@ class Agent:
             self._result(run_id, call, result, tool=tool)
         return True
 
-    def _dispatch_event(self, call: dict, previous_request: dict | None, capabilities: dict) -> dict:
+    def _dispatch_event(self, call: dict, previous_request: dict | None, capabilities: dict,
+                        cli_capabilities: dict | None = None) -> dict:
         if call.get("unsupported"):
-            raise ValueError("Unknown tool. Use bash, or run harness computer --help for graphical operations.")
+            raise ValueError("Unknown tool. Use bash.")
+        if cli_capabilities is not None and not cli_capabilities.get("computer_use"):
+            if call["name"] == "computer_use" or (previous_request and previous_request.get("tool") == "computer_use"):
+                raise ValueError("This capability is disabled for this run.")
         if previous_request:
             # Resume with the exact target, arguments, and timeout shown for approval.
             return {key: value for key, value in previous_request.items() if key != "reason"}
@@ -345,9 +408,14 @@ class Agent:
             # Compatible with native computer calls persisted before the CLI was introduced.
             event["arguments"] = self._route_computer(args, capabilities)
             return event
+        if is_skill_command(args["command"]):
+            event["skill_command"] = True
+            return event
         command = parse_computer_command(args["command"])
         if command is None:
             return event
+        if cli_capabilities is not None and not cli_capabilities.get("computer_use"):
+            raise ValueError("This capability is disabled for this run.")
         if command.action is None:
             return {**event, "help": True}
         action = self._route_computer(self._validate_computer(command.action), capabilities)

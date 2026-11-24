@@ -39,6 +39,7 @@ class WorkerBackend:
         return {
             "environment": "cloud-browser", "desktop": False, "bash": True,
             "safe_bash_path": True, "skill_workspace": True, "artifact_workspace": True,
+            "cli_capability_toggles": True,
             "computer": True, "computer_cli": True, "download": True, "upload": True, "actions": list(BROWSER_ACTIONS),
             "computer_targets": {"browser": list(BROWSER_ACTIONS)},
         }
@@ -81,7 +82,8 @@ class WorkerBackend:
                 raise ValueError("Run is closed")
             stage_upload(run.path, path, offset, total, data)
 
-    async def bash(self, run_id: str, command: str, timeout: float) -> dict:
+    async def bash(self, run_id: str, command: str, timeout: float, *,
+                   cli_capabilities: dict[str, bool] | None = None) -> dict:
         run = self._get_run(run_id)
         async with run.lock:
             if run.closed:
@@ -95,11 +97,15 @@ class WorkerBackend:
                     [*arguments, "-p", "-c", "PATH=/usr/bin:/bin\n" + command],
                     cwd=run.path, timeout=timeout, environment=environment,
                 )
-            with artifact_requests(run.path) as (setup, channel):
+            if cli_capabilities is not None and not any(cli_capabilities.values()):
+                return await run_shell(
+                    [*arguments, "-c", command], cwd=run.path, timeout=timeout, environment=environment,
+                )
+            with artifact_requests(run.path, cli_capabilities) as (setup, channel):
                 result = await run_shell(
                     [*arguments, "-c", setup + command], cwd=run.path, timeout=timeout, environment=environment,
                 )
-                return await add_artifact_content(result, run.path, channel)
+                return await add_artifact_content(result, run.path, channel, cli_capabilities)
 
     async def computer(self, run_id: str, action: dict) -> dict:
         run = self._get_run(run_id)

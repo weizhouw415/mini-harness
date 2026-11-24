@@ -32,5 +32,5 @@ class ToolContextTest(unittest.TestCase):
                 self.assertIn("## Tool Usage Policy", system)
                 self.assertIn("## Skill Awareness", system)
                 self.assertEqual(".mini-harness/skills/active/index.json" in system, use_workspace)
-                self.assertEqual(".mini-harness/skills/candidates/<name>/SKILL.md" in system, use_workspace)
+                self.assertIn("harness skill manage", system)
                 self.assertEqual("Check the processed CSV row count." in system, not use_workspace)

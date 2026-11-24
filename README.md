@@ -7,7 +7,7 @@ Mini Harness 采用单工具架构。一个 Agent Loop 统一推理、执行和�
 - **Bash 是唯一的模型执行接口。** 优先用命令、脚本、SDK 和 API 处理任务。
 - **CLI 封装能力。** `harness computer` 操作界面，`harness view` 检查产物，`harness register` 交付文件。Skill 和 Env 是同一命令体系里可继续扩展的入口，目前通过工作区技能索引和 Worker 能力声明发现。
 - **Artifact 承载感知。** 上传文件、截图和运行产物共享文件引用与多模态观察。支持视觉的模型可以直接查看画面，再据此验证和修正结果。
-- **Skills 沉淀可复用的能力。** 将经过验证的流程和脚本保存为技能，通过评测与审批后供后续任务使用。
+- **Skills 沉淀可复用的能力。** Agent 将有效的流程和脚本保存到技能库，后续任务可以直接查找和复用。
 - **Harness 是稳定的运行时。** 运行时负责绑定 Worker、审批、工作区、事件记录和恢复。新能力可以通过 CLI、Skill 或脚本扩展，模型接口和 Agent Loop 保持稳定。
 
 同一次 Run 的浏览器、命令和文件留在同一个 Worker 中。SQLite 保存会话、审批、工具轨迹和恢复状态。Bash 命令可指定 `timeout`，默认 120 秒，并受 `HARNESS_MAX_TOOL_SECONDS` 上限约束。
@@ -96,24 +96,31 @@ harness computer scroll down 500
 
 ## Skill 学习与复用
 
-启用 Bash 且支持 Skill 工作区的 Worker 会将当前环境中已通过评测的 active Skill 放入运行目录的 `.mini-harness/skills/active/`，索引位于其中的 `index.json`。Agent 可以通过 Bash 读取对应的 `<name>/SKILL.md`，也可将可复用的流程或改进写入 `.mini-harness/skills/candidates/<name>/SKILL.md`。Run 成功结束时，Harness 校验并收录候选。候选需要通过评测并经明确批准后才能用于后续任务。旧 Worker 和未启用 Bash 的 Worker 继续接收匹配的 Skill 指引。
+Agent 先看到 Skill 名称和描述，再按需读取正文或附带文件。通过独立的 Bash 工具调用运行
+`harness skill list`、`harness skill view NAME [PATH]` 或 `harness skill manage`。创建和修订由服务端直接保存，成功后即可复用。
+遇到可复用的流程、解决了难题或得到用户纠正时，Agent 优先修补已有 Skill。
 
-1. 也可对已完成的 Run 执行 `mini-harness learn RUN_ID`，让模型从轨迹提出一个 `SKILL.md` 候选。
-2. 用 `mini-harness evaluate NAME VERSION cloud-browser` 在目标环境评测。
-3. 检查候选和评测结果，运行 `mini-harness publish NAME VERSION --yes` 发布。后续任务可使用适用于当前环境的已验证版本。
-4. 用 `mini-harness skills --environment macos-desktop` 查看平台状态，用 `mini-harness rollback NAME VERSION --yes` 恢复已验证的历史版本。
+成功完成的 Run 达到 10 次工具迭代后，Harness 会在后台复盘运行轨迹。复盘可以读取、创建和修订 Skill，
+只使用技能库命令。通过 `HARNESS_SKILL_REVIEW_INTERVAL` 调整间隔，设置为 `0` 可关闭后台复盘。
+也可以运行 `mini-harness learn RUN_ID`，从一条已完成的任务轨迹主动提炼并保存 Skill。
 
-评测依赖任务所需的独立环境和验收条件。部署时通过 `HARNESS_SKILL_EVALUATOR=package.module:function` 配置可信评测入口，或用 `create_app(settings, skill_evaluator=...)` 注入。入口是异步函数，接收 `(skill, environment)`，在隔离的评测 Worker 上运行验收任务，再返回包含布尔字段 `passed` 的 JSON 字典。只有通过当前环境评测的 Skill 才会被用于该环境，未评测的平台会显示为 `untested`。默认启动不注册评测入口。版本文件位于 `HARNESS_DATA_DIR/skills/versions`，生命周期和版本元数据保存在 SQLite。
+`mini-harness skills --environment macos-desktop` 查看技能库，`mini-harness rollback NAME VERSION --yes`
+恢复历史版本。Skill 可以声明适用的 Worker 环境，`available` 表示在所查询的环境可用。
+升级旧技能库时，还没有启用版本的 Skill 会自动启用最近保存的候选。版本文件和附带文件位于
+`HARNESS_DATA_DIR/skills/versions/<name>/<version>/`，状态保存在同级 Skill 库的 `catalog.sqlite`。
 
 ## API 与验收
 
 用 `mini-harness serve` 在本机启动后，直接打开 [本地 Web UI](http://127.0.0.1:8000/)。
-首次运行时在「模型设置」中填写供应商名称、OpenAI 兼容的 Base URL、模型名及服务需要的 API Key。可以保存多组供应商配置，并随时启用其中一组；启用后，后续模型请求（包括进行中任务的下一次请求）使用该配置。
+更新代码后需重启服务和 Worker 才会加载新版本；请先处理正在运行、等待审批或暂停的任务，因为重启 Worker 会清理其运行工作区。
+首次运行时在「设置」中填写供应商名称、OpenAI 兼容的 Base URL、模型名及服务需要的 API Key。可以保存多组供应商配置，并随时启用其中一组；启用后，后续模型请求（包括进行中任务的下一次请求）使用该配置。
 设置保存在 `HARNESS_DATA_DIR/model.json`，下次启动会优先使用已保存的配置；未保存时使用环境变量。已有的单模型配置会自动保留为一组供应商配置。
+在「设置 → 能力设置」中可以分别启用或关闭文件预览（`view`）、文件交付（`register`）和界面操作（`computer_use`）。默认均启用，Bash 始终可用；全部关闭时，模型仅通过 Bash 执行任务。设置保存在 `HARNESS_DATA_DIR/capabilities.json`，每个任务开始时固定一份配置，暂停恢复时沿用；修改只影响之后开始的任务。关闭能力时，需同时更新独立运行的 Worker 到支持能力开关的版本。
 免 Token 连接只用于直接访问本机回环地址的浏览器页面，CLI 和外部 API 客户端仍使用 `HARNESS_API_TOKEN`。
 侧栏显示最近 100 个对话及其运行状态，包括通过 CLI 创建的会话。对话运行时可点击「新建对话」开始另一条任务，也可以从侧栏切回查看回复和审批。每个对话在当前轮结束后可继续发送消息。
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。
 Harness 以流式方式向模型请求回复。模型返回的思考过程和正文会随生成进度显示，工具调用收齐后再审批和执行。模型请求的读取超时为 15 分钟，在等待下一段数据时计时。
+当模型服务明确拒绝在 Chat Completions 中同时使用推理和工具，并提示可将 `reasoning_effort` 设为 `none` 时，Harness 会关闭该次请求的推理并重试一次，运行轨迹会提示这一兼容处理。
 后续消息会携带此前已完成、失败或取消运行的事件记录，模型回复按合并后的完整消息回传。历史截图以轨迹中的附件引用保留，不会重新作为图片发送给模型；每次运行使用新的工作区和浏览器上下文。长对话可能超过模型服务的上下文限制。
 
 ### 上传附件与查看产物

@@ -43,43 +43,47 @@ _SCREENSHOT_FORMATS = {
     ".jpeg": ("image/jpeg", "JPEG"),
     ".webp": ("image/webp", "WEBP"),
 }
-_CLI = r"""#!/bin/bash
-if [[ "${1-}" == --help || "${2-}" == --help ]]; then
-    case "${1-}" in
-        view)
-            printf '%s\n' 'Usage: harness view [OPTIONS] FILE ...' \
-                '  --detail low|auto|high        Set raster preview resolution.' \
-                '  --crop X,Y,WIDTH,HEIGHT       Crop a raster image in pixels.' \
-                '  --pages 1-3,5                Select PDF, Word, or PowerPoint pages.' \
-                '  --overview                   Request a compact overview.' \
-                '  --sheet NAME                 Select an XLSX worksheet.' \
-                '  --frames N                   Limit image animation or video frames.' \
-                '  --start SECONDS --end SECONDS --fps RATE' \
-                '                               Select a video time range or frame rate.'
-            ;;
-        register)
-            printf '%s\n' 'Usage: harness register FILE ...' \
-                'Make explicitly selected workspace originals downloadable to the operator.'
-            ;;
-        computer) command -p cat -- "${MINI_HARNESS_ARTIFACT_REQUESTS%/*}/computer-help.txt" ;;
-        *) printf '%s\n' 'Usage: harness view [OPTIONS] FILE ... | harness register FILE ... | harness computer ...' ;;
-    esac
-    exit 0
-fi
-case "${1-}" in
-    view|register) ;;
-    computer)
-        printf '%s\n' 'Submit harness computer as its own tool command for GUI approval.' >&2
-        exit 2
-        ;;
-    *) printf '%s\n' 'Usage: harness view [OPTIONS] FILE ... | harness register FILE ... | harness computer ...' >&2; exit 2 ;;
-esac
-if (( $# < 2 || $# > 40 )); then
-    printf '%s\n' 'Supply one or more workspace files to harness view or register.' >&2
-    exit 2
-fi
-printf '%s\0' "$#" "$MINI_HARNESS_RUN_ROOT" "$PWD" "$@" >> "$MINI_HARNESS_ARTIFACT_REQUESTS"
-"""
+DEFAULT_CLI_CAPABILITIES = {"view": True, "register": True, "computer_use": True}
+
+
+def _cli_script(enabled: dict[str, bool]) -> str:
+    commands = []
+    help_cases = []
+    if enabled.get("view"):
+        commands.append("view")
+        help_cases.append("""        view)
+            printf '%s\\n' 'Usage: harness view [OPTIONS] FILE ...' \\
+                '  --detail low|auto|high        Set raster preview resolution.' \\
+                '  --crop X,Y,WIDTH,HEIGHT       Crop a raster image in pixels.' \\
+                '  --pages 1-3,5                Select PDF, Word, or PowerPoint pages.' \\
+                '  --overview                   Request a compact overview.' \\
+                '  --sheet NAME                 Select an XLSX worksheet.' \\
+                '  --frames N                   Limit image animation or video frames.' \\
+                '  --start SECONDS --end SECONDS --fps RATE' \\
+                '                               Select a video time range or frame rate.' ;;
+""")
+    if enabled.get("register"):
+        commands.append("register")
+        help_cases.append("""        register) printf '%s\\n' 'Usage: harness register FILE ...' 'Make selected workspace files downloadable.' ;;
+""")
+    if enabled.get("computer_use"):
+        commands.append("computer")
+        help_cases.append('        computer) command -p cat -- "${MINI_HARNESS_ARTIFACT_REQUESTS%/*}/computer-help.txt" ;;\n')
+    usage = ' | '.join('harness ' + name + ' ...' for name in commands)
+    artifact_commands = '|'.join(name for name in ('view', 'register') if enabled.get(name))
+    dispatch = f'    {artifact_commands}) ;;\n' if artifact_commands else ''
+    if enabled.get("computer_use"):
+        dispatch += "    computer) printf '%s\\n' 'Submit this command as its own tool command for GUI approval.' >&2; exit 2 ;;\n"
+    return ("#!/bin/bash\n"
+            'if [[ "${1-}" == --help || "${2-}" == --help ]]; then\n'
+            '    case "${1-}" in\n' + ''.join(help_cases)
+            + f"        *) printf '%s\\n' 'Usage: {usage}' ;;\n"
+            '    esac\n    exit 0\nfi\ncase "${1-}" in\n' + dispatch
+            + f"    *) printf '%s\\n' 'Usage: {usage}' >&2; exit 2 ;;\n"
+            'esac\nif (( $# < 2 || $# > 40 )); then\n'
+            "    printf '%s\\n' 'Supply one or more workspace files.' >&2\n    exit 2\nfi\n"
+            "printf '%s\\0' \"$#\" \"$MINI_HARNESS_RUN_ROOT\" \"$PWD\" \"$@\" >> \"$MINI_HARNESS_ARTIFACT_REQUESTS\"\n")
+
 
 
 @contextmanager
@@ -283,15 +287,17 @@ def _relative_path(root: str, cwd: str, path: str) -> tuple[str, ...]:
 
 
 @contextmanager
-def artifact_requests(workspace: Path):
+def artifact_requests(workspace: Path, cli_capabilities: dict[str, bool] | None = None):
     from harness.execution.computer_cli import COMPUTER_HELP
 
+    enabled = DEFAULT_CLI_CAPABILITIES if cli_capabilities is None else cli_capabilities
     with TemporaryDirectory(prefix=CLI_PREFIX, dir=workspace) as directory:
         channel = Path(directory)
         script = channel / "harness"
-        script.write_text(_CLI, encoding="utf-8", newline="\n")
+        script.write_text(_cli_script(enabled), encoding="utf-8", newline="\n")
         script.chmod(0o700)
-        (channel / "computer-help.txt").write_text(COMPUTER_HELP.rstrip() + "\n", encoding="utf-8", newline="\n")
+        if enabled.get("computer_use"):
+            (channel / "computer-help.txt").write_text(COMPUTER_HELP.rstrip() + "\n", encoding="utf-8", newline="\n")
         (channel / "requests").touch(mode=0o600)
         setup = (
             f'export PATH="$PWD/{channel.name}:$PATH"\n'
@@ -355,13 +361,16 @@ def _file_blocks(workspace: Path, parts: tuple[str, ...], command: str, options:
             return preview(snapshot, max_images=remaining_images, **options)
 
 
-def collect_artifacts(workspace: Path, channel: Path) -> list[dict]:
+def collect_artifacts(workspace: Path, channel: Path, cli_capabilities: dict[str, bool] | None = None) -> list[dict]:
+    enabled = DEFAULT_CLI_CAPABILITIES if cli_capabilities is None else cli_capabilities
     blocks = []
     remaining_bytes, remaining_images = MAX_ARTIFACT_RESULT_BYTES, MAX_ARTIFACT_IMAGES
     remaining_text = MAX_TEXT_WIRE_BYTES
     files = 0
     try:
         for root, cwd, command, args in _requests(workspace, channel):
+            if not enabled.get(command):
+                raise ValueError("Requested capability is disabled.")
             paths, options = _parse(command, args)
             for path in paths:
                 files += 1
@@ -400,9 +409,10 @@ def collect_artifacts(workspace: Path, channel: Path) -> list[dict]:
     return blocks
 
 
-async def add_artifact_content(result: dict, workspace: Path, channel: Path | None) -> dict:
+async def add_artifact_content(result: dict, workspace: Path, channel: Path | None,
+                               cli_capabilities: dict[str, bool] | None = None) -> dict:
     if channel is not None and not result["timed_out"]:
-        task = asyncio.create_task(asyncio.to_thread(collect_artifacts, workspace, channel))
+        task = asyncio.create_task(asyncio.to_thread(collect_artifacts, workspace, channel, cli_capabilities))
         try:
             content = await asyncio.shield(task)
         except asyncio.CancelledError:

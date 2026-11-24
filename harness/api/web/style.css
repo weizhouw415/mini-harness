@@ -696,6 +696,23 @@ dialog input:not([type="checkbox"]) {
 .provider-detail { margin: 5px 0 10px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .provider-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .provider-actions button { padding: 5px 9px; font-size: 12px; }
+.capability-intro { margin: -5px 0 14px; color: var(--muted); font-size: 13px; }
+.capability-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 9px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.capability-option span { display: grid; gap: 4px; }
+.capability-option strong { font-size: 14px; }
+.capability-option small { color: var(--muted); font-size: 12px; font-weight: 400; }
+.capability-option input { flex: none; width: 18px; height: 18px; accent-color: var(--accent); }
+#capabilities-form .dialog-actions { margin-top: 16px; }
 #model-error { margin: 12px 0 0; font-size: 13px; }
 #key-hint { margin: -9px 0 12px; color: var(--muted); font-size: 12px; }
 #clear-key-label { display: block; margin-bottom: 12px; color: var(--muted); }

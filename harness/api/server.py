@@ -13,11 +13,11 @@ from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, StrictBool
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOADS, file_name
-from harness.config import ModelConfig, Settings
+from harness.config import CapabilityConfig, ModelConfig, Settings
 from harness.core.agent import Agent
 from harness.core.llm import ModelError, OpenAICompatible
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerTarget, WorkerUnavailable
@@ -43,6 +43,14 @@ class ApprovalRequest(BaseModel):
 
 class ApprovalModeRequest(BaseModel):
     approval_mode: Literal["manual", "auto", "allow"]
+
+
+class CapabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    view: StrictBool
+    register_artifacts: StrictBool = Field(alias="register")
+    computer_use: StrictBool
 
 
 class ModelRequest(BaseModel):
@@ -95,8 +103,11 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
         raise ValueError("Set HARNESS_WORKER_SECRET or HARNESS_WORKER_SECRETS to authenticate workers.")
     if settings.max_steps < 1 or settings.context_chars < 1_000 or settings.max_tool_seconds < 1:
         raise ValueError("Invalid run limits.")
+    if settings.skill_review_interval < 0:
+        raise ValueError("HARNESS_SKILL_REVIEW_INTERVAL must be nonnegative.")
     store = RunStore(settings.data_dir)
     model_config = ModelConfig(settings)
+    capability_config = CapabilityConfig(settings)
 
     def retain_run(worker_id: str, run_id: str, workspace_id: str) -> bool:
         try:
@@ -112,7 +123,7 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
                else WorkerManager(settings.worker_secret, retain_run=retain_run))
     skills = SkillStore(settings.data_dir / "skills")
     llm = llm if llm is not None else OpenAICompatible(model_config)
-    agent = Agent(settings, store, workers, skills, llm)
+    agent = Agent(settings, store, workers, skills, llm, capability_config=capability_config)
     evaluator = skill_evaluator if skill_evaluator is not None else configured_evaluator()
 
     @asynccontextmanager
@@ -176,10 +187,22 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
         return {"status": "ok"}
 
     web = Path(__file__).with_name("web")
+    # Keep the UI paired with the routes loaded by this process. Serving files
+    # from disk on each request can mix a newly updated UI with an older server.
+    web_media_types = {
+        "index.html": "text/html",
+        "app.js": "text/javascript",
+        "style.css": "text/css",
+        "markdown.js": "text/javascript",
+        "markdown.css": "text/css",
+        "marked.umd.js": "text/javascript",
+        "purify.min.js": "text/javascript",
+    }
+    web_assets = {name: (web / name).read_bytes() for name in web_media_types}
 
     @app.get("/", include_in_schema=False)
     async def web_ui():
-        return FileResponse(web / "index.html", headers={
+        return Response(web_assets["index.html"], media_type=web_media_types["index.html"], headers={
             "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; "
                                        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
             "X-Content-Type-Options": "nosniff",
@@ -205,6 +228,17 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     def require_local_model_access(request: Request):
         if not is_local_ui(request):
             raise HTTPException(403, "Open the Web UI on the local server's loopback address.")
+
+    @app.get("/ui/capabilities", include_in_schema=False)
+    async def read_capabilities(request: Request):
+        require_local_model_access(request)
+        return JSONResponse(capability_config.values, headers={"Cache-Control": "no-store"})
+
+    @app.put("/ui/capabilities", include_in_schema=False)
+    async def write_capabilities(request: Request, config: CapabilityRequest):
+        require_local_model_access(request)
+        capability_config.save(config.model_dump(by_alias=True))
+        return JSONResponse(capability_config.values, headers={"Cache-Control": "no-store"})
 
     def validate_model(config: ModelRequest):
         model, base_url = config.model.strip(), config.base_url.strip().rstrip("/")
@@ -280,9 +314,10 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
         return providers_status()
 
     @app.get("/ui/{asset}", include_in_schema=False)
-    async def web_asset(asset: Literal["app.js", "style.css", "markdown.js", "markdown.css",
-                                      "marked.umd.js", "purify.min.js"]):
-        return FileResponse(web / asset, headers={"Cache-Control": "no-cache"})
+    async def web_asset(asset: str):
+        if asset == "index.html" or asset not in web_assets:
+            raise HTTPException(404, "Asset not found.")
+        return Response(web_assets[asset], media_type=web_media_types[asset], headers={"Cache-Control": "no-cache"})
 
     @app.websocket("/v1/workers/ws")
     async def worker_socket(websocket: WebSocket):

@@ -20,7 +20,7 @@ class SkillWorkspaceTest(unittest.IsolatedAsyncioTestCase):
         self.skills = SkillStore(self.directory / "catalog")
         self.staging = self.workspace / ".mini-harness" / "skills"
 
-    async def test_only_verified_active_skills_are_seeded_and_drafts_remain_candidates(self):
+    async def test_legacy_published_skills_and_automatically_activated_drafts(self):
         async def verify(skill, environment):
             return {"passed": True}
 
@@ -44,8 +44,8 @@ class SkillWorkspaceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.skills.import_workspace_candidates(collected["candidates"]), {
                 "accepted": 1, "rejected": 0,
             })
-        self.assertEqual(self.skills.get("csv-roundtrip", "1.1.0")["state"], "candidate")
-        self.assertEqual(self.skills.get("csv-roundtrip")["version"], "1.0.0")
+        self.assertEqual(self.skills.get("csv-roundtrip", "1.1.0")["state"], "active")
+        self.assertEqual(self.skills.get("csv-roundtrip")["version"], "1.1.0")
         self.assertEqual(self.skills.import_workspace_candidates([
             {"name": "wrong-name", "content": document("2.0.0")},
             {"name": "csv-roundtrip", "content": document("1.1.0") + "\nChanged content\n"},

@@ -7,11 +7,14 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
 from time import time
+from unicodedata import normalize
 from uuid import uuid4
 
 import yaml
+
+from harness.artifacts.files import workspace_path
 
 from .matcher import rank_skills
 
@@ -19,6 +22,7 @@ ENVIRONMENTS = frozenset({"cloud-browser", "macos-desktop", "windows-desktop"})
 MAX_SKILL_BYTES = 24_000
 MAX_WORKSPACE_SKILLS = 32
 MAX_WORKSPACE_SKILL_BYTES = 128_000
+SKILL_FILE_DIRECTORIES = frozenset({"references", "templates", "scripts", "assets"})
 EVALUATION_LEASE_SECONDS = 300
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 VERSION_PATTERN = re.compile(
@@ -31,15 +35,19 @@ class SkillError(ValueError):
     """A skill document or lifecycle operation is invalid."""
 
 
-def parse_skill(content: str) -> dict:
+def _text_size(content: str, label: str) -> int:
     if not isinstance(content, str):
-        raise SkillError("Skill content must be UTF-8 text no larger than 24 KB")
+        raise SkillError(f"{label} must be UTF-8 text no larger than 24 KB")
     try:
         size = len(content.encode("utf-8"))
     except UnicodeEncodeError as exc:
-        raise SkillError("Skill content must be valid UTF-8") from exc
+        raise SkillError(f"{label} must be valid UTF-8") from exc
     if size > MAX_SKILL_BYTES:
-        raise SkillError("Skill content must be UTF-8 text no larger than 24 KB")
+        raise SkillError(f"{label} must be UTF-8 text no larger than 24 KB")
+    return size
+
+
+def _frontmatter(content: str) -> tuple[dict, str]:
     lines = content.strip().splitlines()
     if not lines or lines[0] != "---":
         raise SkillError("SKILL.md must begin with YAML frontmatter")
@@ -48,9 +56,15 @@ def parse_skill(content: str) -> dict:
         fields = yaml.safe_load("\n".join(lines[1:end]))
     except (ValueError, yaml.YAMLError, RecursionError) as exc:
         raise SkillError("SKILL.md has invalid YAML frontmatter") from exc
-    if not isinstance(fields, dict) or not "\n".join(lines[end + 1 :]).strip():
+    body = "\n".join(lines[end + 1 :])
+    if not isinstance(fields, dict) or not body.strip():
         raise SkillError("SKILL.md requires frontmatter and instructions")
+    return fields, body
 
+
+def parse_skill(content: str) -> dict:
+    _text_size(content, "Skill content")
+    fields, _ = _frontmatter(content)
     name = fields.get("name")
     if not isinstance(name, str) or len(name) > 64 or not NAME_PATTERN.fullmatch(name):
         raise SkillError("Skill name must be up to 64 lowercase letters, digits and hyphens")
@@ -71,14 +85,28 @@ def parse_skill(content: str) -> dict:
     if not isinstance(environments, list) or any(
         not isinstance(item, str) or item not in ENVIRONMENTS for item in environments
     ):
-        raise SkillError("Skill environments must list supported worker environments")
+        raise SkillError("Skill environments must list supported worker environments: "
+                         + ", ".join(sorted(ENVIRONMENTS)))
     return {
         "name": name,
         "description": description.strip(),
         "version": version,
+        "version_explicit": "version" in fields or "version" in metadata,
         "environments": sorted(set(environments)),
+        "environments_explicit": "environments" in fields,
         "content": content.strip() + "\n",
     }
+
+
+def _skill_file_path(path: str) -> str:
+    try:
+        normalized = workspace_path(path)
+    except ValueError as error:
+        raise SkillError("Skill files require a safe relative path") from error
+    directory, slash, _ = normalized.partition("/")
+    if not slash or directory not in SKILL_FILE_DIRECTORIES:
+        raise SkillError("Skill files belong under references/, templates/, scripts/, or assets/")
+    return normalized
 
 
 class SkillStore:
@@ -112,8 +140,41 @@ class SkillStore:
                     PRIMARY KEY (name, version, environment),
                     FOREIGN KEY (name, version) REFERENCES versions (name, version)
                 );
+                CREATE TABLE IF NOT EXISTS direct_versions (
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    PRIMARY KEY (name, version),
+                    FOREIGN KEY (name, version) REFERENCES versions (name, version)
+                );
+                CREATE TABLE IF NOT EXISTS skill_files (
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    PRIMARY KEY (name, version, path),
+                    FOREIGN KEY (name, version) REFERENCES versions (name, version)
+                );
                 """
             )
+        with self._connection(write=True) as db:
+            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                db.execute("""
+                    INSERT INTO direct_versions (name, version)
+                    SELECT name, version FROM (
+                        SELECT name, version, row_number() OVER (
+                            PARTITION BY name ORDER BY created_at DESC, version DESC
+                        ) AS position FROM versions AS draft
+                        WHERE state = 'candidate' AND NOT EXISTS (
+                            SELECT 1 FROM versions AS published
+                            WHERE published.name = draft.name AND published.state = 'active'
+                        )
+                    ) WHERE position = 1
+                """)
+                db.execute("""
+                    UPDATE versions SET state = 'active'
+                    WHERE (name, version) IN (SELECT name, version FROM direct_versions)
+                """)
+                db.execute("PRAGMA user_version = 1")
 
     @contextmanager
     def _connection(self, *, write: bool = False):
@@ -131,45 +192,36 @@ class SkillStore:
         return self.path / "versions" / name / version / "SKILL.md"
 
     def create_candidate(self, content: str) -> dict:
-        return self._create_candidate(parse_skill(content))
-
-    def _create_candidate(self, skill: dict, *, accept_existing: bool = False) -> dict:
+        skill = parse_skill(content)
         name, version = skill["name"], skill["version"]
         with self._connection(write=True) as db:
-            existing = db.execute(
-                "SELECT content FROM versions WHERE name = ? AND version = ?", (name, version)
-            ).fetchone()
-            if existing is not None:
-                if accept_existing and existing["content"] == skill["content"]:
-                    return self._get(db, name, version)
+            if not self._unused_version(db, name, version):
                 raise SkillError(f"Skill {name} version {version} already exists")
-            db.execute(
-                """
-                INSERT INTO versions VALUES (?, ?, ?, ?, ?, 'candidate', ?)
-                """,
-                (
-                    name,
-                    version,
-                    skill["description"],
-                    json.dumps(skill["environments"]),
-                    skill["content"],
-                    time(),
-                ),
-            )
-            document = self._document(name, version)
-            document.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = None
-            try:
-                with NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=document.parent, delete=False
-                ) as temporary:
-                    temporary_path = Path(temporary.name)
-                    temporary.write(skill["content"])
-                os.replace(temporary_path, document)
-            finally:
-                if temporary_path is not None:
-                    temporary_path.unlink(missing_ok=True)
-            return self._get(db, name, version)
+            return self._insert_version(db, skill)
+
+    def _insert_version(self, db: sqlite3.Connection, skill: dict, *, files: dict | None = None) -> dict:
+        name, version = skill["name"], skill["version"]
+        state = "candidate" if files is None else "active"
+        if files is not None:
+            db.execute("UPDATE versions SET state = 'deprecated' WHERE name = ? AND state = 'active'", (name,))
+        db.execute(
+            "INSERT INTO versions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, version, skill["description"], json.dumps(skill["environments"]), skill["content"], state, time()),
+        )
+        if files is not None:
+            db.execute("INSERT INTO direct_versions VALUES (?, ?)", (name, version))
+            db.executemany("INSERT INTO skill_files VALUES (?, ?, ?, ?)",
+                           [(name, version, path, content) for path, content in files.items()])
+        directory = self._document(name, version).parent
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=directory.parent) as temporary:
+            staging = Path(temporary) / "version"
+            for path, content in {"SKILL.md": skill["content"], **(files or {})}.items():
+                destination = staging / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content, encoding="utf-8", newline="\n")
+            os.replace(staging, directory)
+        return self._get(db, name, version)
 
     @staticmethod
     def _environment(environment: str) -> None:
@@ -183,6 +235,7 @@ class SkillStore:
         *,
         environment: str | None = None,
         include_content: bool = False,
+        available: bool | None = None,
     ) -> dict:
         name, version = row["name"], row["version"]
         declared = json.loads(row["environments"])
@@ -214,6 +267,8 @@ class SkillStore:
             record["content"] = row["content"]
         if environment is not None:
             record["environment_status"] = evaluations.get(environment, {}).get("status", "untested")
+            if available is not None:
+                record["available"] = available
         return record
 
     def _get(self, db: sqlite3.Connection, name: str, version: str | None, *, environment=None) -> dict:
@@ -245,20 +300,168 @@ class SkillStore:
                 "SELECT name, version, description, environments, state, created_at "
                 "FROM versions ORDER BY name, created_at DESC"
             )
-            return [self._record(db, row, environment=environment) for row in rows]
+            if environment is None:
+                return [self._record(db, row) for row in rows]
+            available = {(row["name"], row["version"]) for row in self._active_entries(db, environment)}
+            return [self._record(db, row, environment=environment, available=(row["name"], row["version"]) in available)
+                    for row in rows]
 
     @staticmethod
-    def _verified_active(db: sqlite3.Connection, environment: str) -> list[dict]:
-        return [
-            dict(row) for row in db.execute(
-                """
-                SELECT name, version, description FROM versions JOIN evaluations USING (name, version)
-                WHERE state = 'active' AND environment = ? AND status = 'passed'
-                ORDER BY name
-                """,
-                (environment,),
-            )
-        ]
+    def _active_entries(db: sqlite3.Connection, environment: str | None,
+                        *, name: str | None = None) -> list[sqlite3.Row]:
+        return db.execute(
+            """
+            SELECT v.name, v.version, v.description, v.environments, v.state, v.created_at
+            FROM versions AS v LEFT JOIN direct_versions AS direct USING (name, version)
+            WHERE v.state = 'active' AND (? IS NULL OR v.name = ?)
+            AND (? IS NULL OR (
+                direct.name IS NOT NULL AND (json_array_length(v.environments) = 0 OR ? IN (
+                    SELECT value FROM json_each(v.environments)
+                ))
+            ) OR (
+                direct.name IS NULL AND EXISTS (
+                    SELECT 1 FROM evaluations AS e
+                    WHERE e.name = v.name AND e.version = v.version AND e.environment = ? AND e.status = 'passed'
+                )
+            ))
+            ORDER BY v.name
+            """,
+            (name, name, environment, environment, environment),
+        ).fetchall()
+
+    def active_index(self, environment: str | None = None) -> list[dict]:
+        if environment is not None:
+            self._environment(environment)
+        with self._connection() as db:
+            return [self._record(db, row, environment=environment, available=True)
+                    for row in self._active_entries(db, environment)]
+
+    def _read_active(self, db: sqlite3.Connection, name: str, environment: str | None) -> dict:
+        if environment is not None:
+            self._environment(environment)
+        if not self._active_entries(db, environment, name=name):
+            raise SkillError("No active skill with this name is available in this environment")
+        return self._get(db, name, None)
+
+    @staticmethod
+    def _files(db: sqlite3.Connection, name: str, version: str) -> dict[str, str]:
+        return dict(db.execute(
+            "SELECT path, content FROM skill_files WHERE name = ? AND version = ? ORDER BY path", (name, version),
+        ))
+
+    def view_active(self, name: str, environment: str | None = None, path: str | None = None) -> dict:
+        with self._connection() as db:
+            skill = self._read_active(db, name, environment)
+            record = {"name": name, "version": skill["version"]}
+            files = self._files(db, name, skill["version"])
+            if path is None or path == "SKILL.md":
+                return {**record, "document": skill["content"], "files": list(files)}
+            path = _skill_file_path(path)
+            if path not in files:
+                raise SkillError("Skill file does not exist")
+            return {**record, "path": path, "document": files[path]}
+
+    def _check_base(self, db: sqlite3.Connection, name: str, base_version: str, environment: str | None) -> dict:
+        current = self._read_active(db, name, environment)
+        if current["version"] != base_version:
+            raise SkillError(f"Skill has changed to version {current['version']}. Read it again before editing.")
+        return current
+
+    def _unused_version(self, db: sqlite3.Connection, name: str, version: str) -> bool:
+        return (db.execute("SELECT 1 FROM versions WHERE name = ? AND version = ?", (name, version)).fetchone() is None
+                and not self._document(name, version).parent.exists())
+
+    @staticmethod
+    def _is_direct(db: sqlite3.Connection, name: str, version: str) -> bool:
+        record = db.execute("SELECT 1 FROM direct_versions WHERE name = ? AND version = ?", (name, version)).fetchone()
+        return record is not None
+
+    def _save_revision(self, db: sqlite3.Connection, skill: dict, current: dict | None = None,
+                       *, files: dict[str, str] | None = None) -> dict:
+        name, version = skill["name"], skill["version"]
+        if current is not None and current["content"] == skill["content"] and files is None:
+            return current
+        fields_to_update = {}
+        if current is not None and not skill["environments_explicit"]:
+            if self._is_direct(db, name, current["version"]):
+                environments = parse_skill(current["content"])["environments"]
+            else:
+                environments = sorted(env for env, result in current["evaluations"].items() if result["status"] == "passed")
+            if environments:
+                fields_to_update["environments"] = environments
+        if (current is not None and not skill["version_explicit"]) or not self._unused_version(db, name, version):
+            base = current["version"] if current is not None else version
+            major, minor, patch = (int(part) for part in base.split("-", 1)[0].split("."))
+            while True:
+                patch += 1
+                version = f"{major}.{minor}.{patch}"
+                if len(version) > 64:
+                    raise SkillError("Supply a shorter unused semantic version")
+                if self._unused_version(db, name, version):
+                    break
+            fields_to_update["version"] = version
+        if fields_to_update:
+            fields, body = _frontmatter(skill["content"])
+            fields.update(fields_to_update)
+            skill = parse_skill("---\n" + yaml.safe_dump(fields, allow_unicode=True, sort_keys=False) + "---\n" + body)
+        if files is None:
+            files = self._files(db, name, current["version"]) if current is not None else {}
+        return self._insert_version(db, skill, files=files)
+
+    def save_active(self, content: str, *, name: str | None = None, base_version: str | None = None,
+                    environment: str | None = None, allow_update: bool = False) -> dict:
+        if environment is not None:
+            self._environment(environment)
+        skill = parse_skill(content)
+        if name is not None and skill["name"] != name:
+            raise SkillError("Skill name must match SKILL.md frontmatter")
+        name = skill["name"]
+        with self._connection(write=True) as db:
+            current = None
+            if base_version is not None:
+                current = self._check_base(db, name, base_version, environment)
+            elif self._active_entries(db, None, name=name):
+                if not allow_update:
+                    raise SkillError("An active skill with this name already exists. Read it before editing.")
+                current = self._read_active(db, name, environment)
+            return self._save_revision(db, skill, current)
+
+    def patch_active(self, name: str, base_version: str, old_string: str, new_string: str,
+                     *, environment: str | None = None) -> dict:
+        _text_size(old_string, "Skill patch search text")
+        _text_size(new_string, "Skill patch replacement")
+        if not old_string:
+            raise SkillError("Skill patch search text must be nonempty")
+        with self._connection(write=True) as db:
+            current = self._check_base(db, name, base_version, environment)
+            content = current["content"]
+            position = content.find(old_string)
+            if position < 0 or content.find(old_string, position + 1) >= 0:
+                raise SkillError("Skill patch search text must match exactly once")
+            skill = parse_skill(content.replace(old_string, new_string, 1))
+            if skill["name"] != name:
+                raise SkillError("A skill edit cannot change its name")
+            return self._save_revision(db, skill, current)
+
+    def write_skill_file(self, name: str, base_version: str, path: str, content: str,
+                         *, environment: str | None = None) -> dict:
+        path = _skill_file_path(path)
+        _text_size(content, "Skill file")
+        with self._connection(write=True) as db:
+            current = self._check_base(db, name, base_version, environment)
+            files = self._files(db, name, base_version)
+            if path in files and files[path] == content:
+                return current
+            target = normalize("NFC", path).casefold()
+            for existing in files.keys() - {path}:
+                other = normalize("NFC", existing).casefold()
+                if other == target or other.startswith(target + "/") or target.startswith(other + "/"):
+                    raise SkillError("Skill file path collides with an existing file")
+            files[path] = content
+            size = sum(len(text.encode("utf-8")) for text in files.values())
+            if len(files) > MAX_WORKSPACE_SKILLS or size > MAX_WORKSPACE_SKILL_BYTES:
+                raise SkillError("A skill can contain up to 32 supporting files totaling 128 KB")
+            return self._save_revision(db, parse_skill(current["content"]), current, files=files)
 
     def match(self, query: str, environment: str, *, limit: int = 3) -> list[dict]:
         self._environment(environment)
@@ -267,14 +470,14 @@ class SkillStore:
         with self._connection() as db:
             return [
                 self._get(db, skill["name"], skill["version"], environment=environment)
-                for skill in rank_skills(query, self._verified_active(db, environment))[:limit]
+                for skill in rank_skills(query, self._active_entries(db, environment))[:limit]
             ]
 
     def workspace_snapshot(self, environment: str, query: str) -> list[dict]:
-        """Export verified active skill documents for Bash discovery on one worker."""
+        """Export applicable active skill documents for Bash discovery on one worker."""
         self._environment(environment)
         with self._connection() as db:
-            eligible = self._verified_active(db, environment)
+            eligible = [dict(row) for row in self._active_entries(db, environment)]
             matches = rank_skills(query, eligible)
             matched_names = {item["name"] for item in matches}
             snapshot = []
@@ -288,7 +491,8 @@ class SkillStore:
                     "SELECT content FROM versions WHERE name = ? AND version = ?",
                     (item["name"], item["version"]),
                 ).fetchone()["content"]
-                skill = {**item, "content": content}
+                skill = {key: item[key] for key in ("name", "version", "description")}
+                skill["content"] = content
                 size = sum(len(value.encode("utf-8")) for value in skill.values())
                 if size <= remaining:
                     snapshot.append(skill)
@@ -296,7 +500,7 @@ class SkillStore:
             return snapshot
 
     def import_workspace_candidates(self, candidates: list) -> dict[str, int]:
-        """Validate staged drafts and import them through the ordinary candidate lifecycle."""
+        """Validate and activate legacy drafts staged in worker run directories."""
         if not isinstance(candidates, list):
             return {"accepted": 0, "rejected": 1}
         accepted = 0
@@ -310,7 +514,16 @@ class SkillStore:
                 if skill["name"] != item.get("name") or size > remaining:
                     continue
                 remaining -= size
-                self._create_candidate(skill, accept_existing=True)
+                with self._connection(write=True) as db:
+                    name, version = skill["name"], skill["version"]
+                    existing = db.execute("SELECT content FROM versions WHERE name = ? AND version = ?",
+                                          (name, version)).fetchone()
+                    if existing is not None:
+                        if existing["content"] != skill["content"]:
+                            raise SkillError(f"Skill {name} version {version} already exists")
+                    else:
+                        current = self._get(db, name, None) if self._active_entries(db, None, name=name) else None
+                        self._save_revision(db, skill, current)
             except SkillError:
                 continue
             accepted += 1
@@ -323,7 +536,8 @@ class SkillStore:
             skill = self._get(db, name, version)
             if skill["state"] != from_state:
                 raise SkillError(f"Expected a {from_state} skill version")
-            if not any(result["status"] == "passed" for result in skill["evaluations"].values()):
+            direct = from_state == "deprecated" and self._is_direct(db, name, version)
+            if not direct and not any(result["status"] == "passed" for result in skill["evaluations"].values()):
                 raise SkillError("Activation requires a passing evaluation")
             db.execute("UPDATE versions SET state = 'deprecated' WHERE name = ? AND state = 'active'", (name,))
             db.execute("UPDATE versions SET state = 'active' WHERE name = ? AND version = ?", (name, version))

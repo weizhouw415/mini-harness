@@ -119,3 +119,51 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
         with self._mock(httpx.Response(400, json={"error": {"message": "unsupported model"}})):
             with self.assertRaisesRegex(ModelError, r"HTTP 400\. unsupported model"):
                 await self.model.complete([], [])
+
+    async def test_explicit_incompatible_reasoning_error_retries_once_with_none(self):
+        error = ("Function tools with reasoning_effort are not supported for gpt-6.1-terra in "
+                 "/v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.")
+        client = httpx.AsyncClient
+
+        def handle(request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return httpx.Response(400, json={"error": {"message": error}})
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=_event({"content": "done"}, finish="stop"))
+
+        with patch("harness.core.llm.httpx.AsyncClient", side_effect=lambda **kwargs: client(
+            **kwargs, transport=httpx.MockTransport(handle),
+        )):
+            result = await self.model.complete([], [{"type": "function"}])
+        first, retry = [json.loads(request.content) for request in self.requests]
+        self.assertNotIn("reasoning_effort", first)
+        self.assertEqual(retry, {**first, "reasoning_effort": "none"})
+        self.assertEqual(result["content"], "done")
+        self.assertEqual(result["_compatibility"], {"reasoning_effort": "none"})
+
+    async def test_no_retry_without_specific_rejected_request_or_after_retry_fails(self):
+        message = ("Function tools with reasoning_effort are not supported in /v1/chat/completions. "
+                   "To use function tools, use /v1/responses or set reasoning_effort to 'none'.")
+        cases = [
+            (400, message, [], 1),
+            (429, message, [{"type": "function"}], 1),
+            (400, "Function tools with reasoning_effort are not supported.", [{"type": "function"}], 1),
+            (400, message, [{"type": "function"}], 2),
+        ]
+        for status, error, tools, count in cases:
+            with self.subTest(status=status, error=error, tools=tools):
+                self.requests.clear()
+                with self._mock(httpx.Response(status, json={"error": {"message": error}})):
+                    with self.assertRaises(ModelError):
+                        await self.model.complete([], tools)
+                self.assertEqual(len(self.requests), count)
+
+    async def test_no_retry_for_stream_errors_even_if_message_mentions_reasoning_none(self):
+        message = ("Function tools with reasoning_effort are not supported. "
+                   "To use function tools, set reasoning_effort to 'none'.")
+        error = ("event: error\ndata: " + json.dumps({"error": {"message": message}}) + "\n\n").encode()
+        response = httpx.Response(200, headers={"content-type": "text/event-stream"}, content=error)
+        with self._mock(response), self.assertRaisesRegex(ModelError, "stream error"):
+            await self.model.complete([], [{"type": "function"}])
+        self.assertEqual(len(self.requests), 1)

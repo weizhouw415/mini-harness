@@ -20,6 +20,7 @@ class Settings:
     max_steps: int = 500
     context_chars: int = 48_000
     max_tool_seconds: int = 120
+    skill_review_interval: int = 10
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -44,6 +45,7 @@ class Settings:
             max_steps=int(os.environ.get("HARNESS_MAX_STEPS", "500")),
             context_chars=int(os.environ.get("HARNESS_CONTEXT_CHARS", "48000")),
             max_tool_seconds=int(os.environ.get("HARNESS_MAX_TOOL_SECONDS", "120")),
+            skill_review_interval=int(os.environ.get("HARNESS_SKILL_REVIEW_INTERVAL", "10")),
         )
 
 
@@ -131,3 +133,39 @@ class ModelConfig:
             if api_key is None:
                 api_key = self.values["api_key"] if base_url == self.values["base_url"] else ""
             self.create("默认供应商", model, base_url, api_key)
+
+
+class CapabilityConfig:
+    """Persist the optional commands exposed to new runs."""
+
+    DEFAULTS = {"view": True, "register": True, "computer_use": True}
+
+    def __init__(self, settings: Settings):
+        self.path = settings.data_dir / "capabilities.json"
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            stored = {}
+        if not isinstance(stored, dict) or any(
+            key in stored and type(stored[key]) is not bool for key in self.DEFAULTS
+        ):
+            raise ValueError("Invalid capability configuration")
+        self._values = {key: stored.get(key, default) for key, default in self.DEFAULTS.items()}
+
+    @property
+    def values(self) -> dict[str, bool]:
+        return self._values.copy()
+
+    def save(self, values: dict[str, bool]) -> None:
+        if set(values) != set(self.DEFAULTS) or any(type(value) is not bool for value in values.values()):
+            raise ValueError("Invalid capability configuration")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                         prefix=".capabilities-", delete=False) as file:
+            path = Path(file.name)
+            try:
+                json.dump(values, file, ensure_ascii=False)
+                file.close()
+                path.replace(self.path)
+            finally:
+                path.unlink(missing_ok=True)
+        self._values = values.copy()

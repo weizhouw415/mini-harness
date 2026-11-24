@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,15 +41,14 @@ class SkillLifecycleTest(unittest.IsolatedAsyncioTestCase):
                 {"message": "fixture passed", "password": "fixture-password"},
             ],
         }
-        candidate = await learn_skill(self.store, trace, generate)
-        self.assertEqual(candidate["state"], "candidate")
+        learned = await learn_skill(self.store, trace, generate)
+        self.assertEqual(learned["state"], "active")
         self.assertEqual(
             (self.path / "versions/csv-roundtrip/1.0.0/SKILL.md").read_text(encoding="utf-8"),
             document(),
         )
-        self.assertEqual(self.store.match("处理 CSV", "cloud-browser"), [])
-        with self.assertRaisesRegex(SkillError, "passing evaluation"):
-            self.store.publish("csv-roundtrip", "1.0.0", approved=True)
+        self.assertEqual([entry["version"] for entry in self.store.match("处理 CSV", "cloud-browser")], ["1.0.0"])
+        self.store.create_candidate(document("1.1.0"))
 
         async def verifier(skill, environment):
             self.assertEqual(skill["state"], "testing")
@@ -56,22 +56,19 @@ class SkillLifecycleTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("verify the uploaded file", skill["content"])
             return {"passed": True, "checks": {"upload_matches": True}}
 
-        evaluated = await evaluate_skill(self.store, "csv-roundtrip", "1.0.0", "cloud-browser", verifier)
+        evaluated = await evaluate_skill(self.store, "csv-roundtrip", "1.1.0", "cloud-browser", verifier)
         self.assertEqual(evaluated["environment_status"], "passed")
         self.assertEqual(evaluated["state"], "candidate")
         with self.assertRaisesRegex(SkillError, "explicit approval"):
-            self.store.publish("csv-roundtrip", "1.0.0", approved=False)
+            self.store.publish("csv-roundtrip", "1.1.0", approved=False)
 
-        self.store.publish("csv-roundtrip", "1.0.0", approved=True)
+        self.store.publish("csv-roundtrip", "1.1.0", approved=True)
         match = self.store.match("处理文件并上传", "cloud-browser")
-        self.assertEqual([entry["version"] for entry in match], ["1.0.0"])
+        self.assertEqual([entry["version"] for entry in match], ["1.1.0"])
         self.assertIn("Process the rows", match[0]["content"])
         self.assertEqual(self.store.match("处理 CSV", "macos-desktop"), [])
         self.assertEqual(self.store.index("macos-desktop")[0]["environment_status"], "untested")
 
-        self.store.create_candidate(document("1.1.0"))
-        await evaluate_skill(self.store, "csv-roundtrip", "1.1.0", "cloud-browser", verifier)
-        self.store.publish("csv-roundtrip", "1.1.0", approved=True)
         self.assertEqual(self.store.get("csv-roundtrip", "1.0.0")["state"], "deprecated")
         self.assertEqual(self.store.get("csv-roundtrip")["version"], "1.1.0")
         self.store.rollback("csv-roundtrip", "1.0.0", approved=True)
@@ -105,3 +102,16 @@ class SkillLifecycleTest(unittest.IsolatedAsyncioTestCase):
         skipped = await learn_skill(self.store, {"status": "completed"}, generate)
         self.assertEqual(skipped["state"], "skipped")
         self.assertEqual(self.store.index(), [])
+
+    def test_upgrade_activates_the_latest_legacy_candidate_for_its_declared_environment(self):
+        for version in ("1.0.0", "1.1.0"):
+            self.store.create_candidate(document(version).replace("  - cloud-browser\n", ""))
+        with sqlite3.connect(self.store.database) as db:
+            db.execute("PRAGMA user_version = 0")
+
+        for _ in range(2):
+            store = SkillStore(self.path)
+            self.assertEqual(store.active_index("cloud-browser"), [])
+            active, = store.active_index("macos-desktop")
+            self.assertEqual((active["version"], active["state"], active["evaluations"]), ("1.1.0", "active", {}))
+            self.assertTrue(active["available"])
