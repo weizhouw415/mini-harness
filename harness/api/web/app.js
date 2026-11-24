@@ -49,6 +49,15 @@ let historyKey = "";
 let workerTouched = false;
 let readyWorkers = {};
 const urls = new Set();
+const visibleHistoryTurns = new IntersectionObserver((entries) => {
+  for (const { target, isIntersecting } of entries) {
+    if (!isIntersecting) continue;
+    visibleHistoryTurns.unobserve(target);
+    const id = target.dataset.runId;
+    const view = turns.get(id);
+    if (view && !view.traceLoaded && !view.loading) void loadTrace(view, id, true);
+  }
+}, { root: $("scroll"), rootMargin: "160px 0px" });
 
 function element(tag, content, className) {
   const node = document.createElement(tag);
@@ -189,7 +198,7 @@ function showRunControls() {
   const args = approval?.arguments;
   const target = tool === "computer_use" ? computerTargetName(args) : "";
   const desktopInput = target && args.target === "desktop"
-    && ["click", "type", "press", "scroll"].includes(args.action);
+    && ["click", "double_click", "right_click", "move", "drag", "type", "press", "key", "scroll"].includes(args.action);
   const toolDetails = [toolName, target, desktopInput ? "会使用鼠标或键盘" : ""].filter(Boolean);
   setText($("approval-tool"), toolDetails.join(" · "));
   const reason = approval?.reason || "";
@@ -231,6 +240,7 @@ function select(hash, initial = null) {
   }
   for (const url of urls) URL.revokeObjectURL(url);
   urls.clear();
+  visibleHistoryTurns.disconnect();
   turns.clear();
   $("turns").replaceChildren();
   run = null;
@@ -330,7 +340,8 @@ const traceIcons = {
 };
 const traceActions = {
   screenshot: "截取屏幕", observe: "观察屏幕", navigate: "打开网页", click: "点击",
-  type: "输入文字", scroll: "滚动页面", press: "按键", download: "下载文件", upload: "上传文件",
+  double_click: "双击", right_click: "右键点击", move: "移动指针", drag: "拖动",
+  type: "输入文字", scroll: "滚动页面", key: "按键", press: "按键", download: "下载文件", upload: "上传文件",
 };
 const traceCallEvents = new Set(["tool_call", "tool_result", "approval_requested", "approval_decision"]);
 const traceTime = new Intl.DateTimeFormat("zh-CN", {
@@ -514,12 +525,22 @@ function showRawEvents(view) {
   view.logRendered = view.eventLog.length;
 }
 
+function appendReasoning(view, content) {
+  if (typeof content !== "string" || !content.trim()) return;
+  const segment = element("div", undefined, "reasoning-segment");
+  renderMarkdown(segment, content);
+  view.reasoningBody.append(segment);
+  view.reasoningPreview.textContent = content.trim();
+  view.reasoning.hidden = false;
+}
+
 function appendEvents(view, events, id) {
   for (const event of events) {
     const { data, type } = event;
     view.after = event.seq;
     view.eventLog.push(event);
     if (type === "assistant") {
+      appendReasoning(view, data.message?.reasoning_content);
       for (const call of data.calls || []) view.plannedCalls.set(call.call_id, call.arguments);
       if (data.message?.content && data.calls?.length) {
         addTraceEntry(view, "message", "助手更新", "", event.created_at, data.message.content);
@@ -591,6 +612,21 @@ function updateTrace(view, value) {
 
 function createTurn(value) {
   const node = element("article", undefined, "turn");
+  node.dataset.runId = value.id;
+
+  const reasoning = element("details", undefined, "reasoning");
+  reasoning.hidden = true;
+  const reasoningSummary = element("summary", undefined, "reasoning-summary");
+  const reasoningSymbol = element("span", undefined, "reasoning-symbol");
+  reasoningSymbol.append(traceIcon("message"));
+  const reasoningPreview = element("span", undefined, "reasoning-preview");
+  reasoningPreview.setAttribute("aria-hidden", "true");
+  reasoningSummary.append(reasoningSymbol, element("span", "思考过程", "reasoning-title"),
+    reasoningPreview, traceIcon("chevron"));
+  const reasoningBody = element("div", undefined, "reasoning-body");
+  reasoning.append(reasoningSummary, reasoningBody);
+  reasoning.addEventListener("toggle", updateJump);
+
   const trace = element("details", undefined, "trace");
   const summary = element("summary", undefined, "trace-summary");
   const symbol = element("span", undefined, "trace-symbol");
@@ -616,9 +652,12 @@ function createTurn(value) {
   trace.append(summary, body);
 
   const answer = element("div", undefined, "turn-answer");
-  node.append(element("div", value.task, "task"), trace, answer);
+  const response = element("div", undefined, "turn-response");
+  response.append(reasoning, trace, answer);
+  node.append(element("div", value.task, "task"), response);
   const view = {
     node, trace, timeline, tracePending, traceError, traceCount, traceStatusLabel, answer,
+    reasoning, reasoningBody, reasoningPreview,
     raw, rawCount, rawEntries, after: 0, eventLog: [], logRendered: 0, calls: new Map(), plannedCalls: new Map(),
   };
   summary.addEventListener("click", () => {
@@ -634,6 +673,7 @@ function createTurn(value) {
   });
   updateTrace(view, value);
   turns.set(value.id, view);
+  if (!active.has(value.status)) visibleHistoryTurns.observe(node);
   return view;
 }
 

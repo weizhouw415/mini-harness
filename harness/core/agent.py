@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from harness.config import Settings
 from harness.core.approval import decide_approval
-from harness.core.context import TOOLS, build_messages
+from harness.core.context import DEFAULT_BASH_TIMEOUT, TOOLS, build_messages
 from harness.core.llm import LLM, ModelError
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
+from harness.skills.loader import SkillError
 from harness.storage.sqlite import RunStore
+from workers.common.actions import point_fields, scroll_deltas, text_field
 
 logger = logging.getLogger(__name__)
 COMPUTER_ACTIONS = {name for name in TOOLS[1]["function"]["parameters"]["properties"]["action"]["enum"]}
@@ -85,13 +88,16 @@ class Agent:
         run_id = run["id"]
         directory = self.store.directory / "artifacts" / run_id
         previous = self.store.previous(run["session_id"], run_id)
+        capabilities = await self._prepare_skill_workspace(run, capabilities)
         while True:
             events = self.store.events(run_id)
             turns = [event["data"] for event in events if event["type"] == "assistant"]
             if turns:
                 latest = turns[-1]
                 if not latest["calls"]:
-                    self.store.transition(run_id, {"running"}, "completed", output=latest["message"]["content"])
+                    candidate_event = await self._collect_skill_candidates(run, capabilities, events)
+                    self.store.transition(run_id, {"running"}, "completed", output=latest["message"]["content"],
+                                          event=candidate_event)
                     return
                 if not await self._deliver(run, capabilities, latest["calls"], events):
                     return
@@ -104,6 +110,41 @@ class Agent:
             message, calls = self._normalize(reply)
             self.store.event(run_id, "assistant", {"message": message, "calls": calls, "usage": reply.get("_usage")})
 
+    async def _prepare_skill_workspace(self, run: dict, capabilities: dict) -> dict:
+        if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
+            return capabilities
+        events = self.store.events(run["id"])
+        if any(event["type"] == "skill_workspace_ready" for event in events):
+            return capabilities
+        # Only populate the workspace before the model can write to it.
+        if not any(event["type"] == "assistant" for event in events):
+            try:
+                skills = self.skills.workspace_snapshot(capabilities["environment"], run["task"])
+                await self.workers.prepare_skill_workspace(run["worker_id"], run["id"], skills)
+            except (SkillError, WorkerCallError, WorkerUnavailable, OSError, sqlite3.Error) as error:
+                logger.warning("Skill workspace unavailable for run %s (%s)", run["id"], type(error).__name__)
+            else:
+                self.store.event(run["id"], "skill_workspace_ready", {"skills": len(skills)})
+                return capabilities
+        return {**capabilities, "skill_workspace": False}
+
+    async def _collect_skill_candidates(self, run: dict, capabilities: dict, events: list[dict]):
+        if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
+            return None
+        if not any(event["type"] == "tool_call" and event["data"]["tool"] == "bash" for event in events):
+            return None
+        try:
+            result = await self.workers.collect_skill_candidates(run["worker_id"], run["id"])
+            candidates, rejected = result.get("candidates"), result.get("rejected")
+            if not isinstance(candidates, list) or type(rejected) is not int or rejected < 0:
+                raise WorkerCallError("Invalid skill workspace result")
+            counts = self.skills.import_workspace_candidates(candidates)
+        except (SkillError, WorkerCallError, WorkerUnavailable, OSError, sqlite3.Error) as error:
+            logger.warning("Skill candidates unavailable for run %s (%s)", run["id"], type(error).__name__)
+            return "skill_candidates", {"status": "unavailable"}
+        counts["rejected"] += rejected
+        return ("skill_candidates", counts) if any(counts.values()) else None
+
     def _normalize(self, reply: dict) -> tuple[dict, list[dict]]:
         if not isinstance(reply, dict):
             raise ModelError("Model returned an invalid assistant message.")
@@ -114,6 +155,11 @@ class Agent:
         if not isinstance(raw_calls, list) or len(raw_calls) > 8:
             raise ModelError("Model returned an invalid number of tool calls.")
         message = {"role": "assistant", "content": text}
+        reasoning = reply.get("reasoning_content")
+        if reasoning is not None:
+            if not isinstance(reasoning, str):
+                raise ModelError("Model returned invalid reasoning content.")
+            message["reasoning_content"] = reasoning
         calls, ids, tool_calls = [], set(), []
         for item in raw_calls:
             try:
@@ -153,11 +199,9 @@ class Agent:
                 continue
             previous_request = requests.get(call_id)
             try:
-                args = self._arguments(call)
+                args = self._arguments(call, previous_request)
                 if call["name"] == "computer_use":
-                    # Execute the target shown at approval time, including old requests without a target.
-                    presented_args = previous_request["arguments"] if previous_request is not None else args
-                    args = self._route_computer(presented_args, capabilities)
+                    args = self._route_computer(args, capabilities)
             except ValueError as error:
                 self._result(run_id, call, {"error": str(error)})
                 continue
@@ -197,15 +241,17 @@ class Agent:
             self._result(run_id, call, result)
         return True
 
-    def _arguments(self, call: dict) -> dict:
+    def _arguments(self, call: dict, previous_request: dict | None = None) -> dict:
         try:
-            args = json.loads(call["arguments"])
+            # Keep the exact arguments already presented to the operator on resume.
+            args = previous_request["arguments"] if previous_request else json.loads(call["arguments"])
         except ValueError as error:
             raise ValueError("Tool arguments must be a JSON object.") from error
         if not isinstance(args, dict):
             raise ValueError("Tool arguments must be a JSON object.")
         if call["name"] == "bash":
-            command, timeout = args.get("command"), args.get("timeout", 30)
+            command = args.get("command")
+            timeout = args.get("timeout", min(DEFAULT_BASH_TIMEOUT, self.settings.max_tool_seconds))
             if set(args) - {"command", "timeout"} or not isinstance(command, str) or not command.strip():
                 raise ValueError("bash requires a nonempty command string and optional timeout.")
             if type(timeout) is not int or not 1 <= timeout <= self.settings.max_tool_seconds:
@@ -224,22 +270,45 @@ class Agent:
             if allowed == "integer" and type(value) is int:
                 continue
             raise ValueError(f"Invalid computer action argument: {key}.")
-        if args["action"] == "navigate":
+        action = args["action"]
+        if action == "navigate":
             url = urlsplit(args.get("url", ""))
             if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password:
                 raise ValueError("Navigate requires an HTTP or HTTPS URL without embedded credentials.")
+        elif action in {"click", "double_click", "right_click", "download"}:
+            if "selector" in args:
+                text_field(args, "selector")
+            else:
+                point_fields(args)
+        elif action in {"move", "drag"}:
+            point_fields(args)
+            if action == "drag":
+                point_fields(args, "end_x", "end_y")
+        elif action in {"key", "press"}:
+            text_field(args, "key", limit=80)
+        elif action == "type":
+            text_field(args, "text", allow_empty=True, limit=100_000)
+        elif action == "scroll":
+            scroll_deltas(args)
+            if "x" in args or "y" in args:
+                point_fields(args)
+        elif action == "upload":
+            text_field(args, "selector")
+            text_field(args, "path")
         return args
 
     @staticmethod
     def _route_computer(args: dict, capabilities: dict) -> dict:
         native_target = "browser" if capabilities.get("environment") == "cloud-browser" else "desktop"
         targets = capabilities.get("computer_targets")
+        target = args.get("target", native_target)
+        if target == "desktop" and args["action"] in {"click", "double_click", "right_click"}:
+            point_fields(args)
         if not isinstance(targets, dict):
-            if args.get("target", native_target) != native_target:
-                raise ValueError(f"This worker does not support computer target: {args['target']}.")
+            if target != native_target:
+                raise ValueError(f"This worker does not support computer target: {target}.")
             return args
 
-        target = args.get("target", native_target)
         actions = targets.get(target)
         if not isinstance(actions, list):
             raise ValueError(f"This worker does not support computer target: {target}.")

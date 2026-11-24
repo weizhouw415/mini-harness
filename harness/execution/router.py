@@ -397,6 +397,16 @@ class WorkerManager:
             call_id, "computer.execute", {"run_id": run_id, "action": action}, 120
         )
 
+    async def prepare_skill_workspace(self, worker_id: str, run_id: str, skills: list[dict]) -> None:
+        await self._get_worker(worker_id, run_id).request(
+            secrets.token_hex(16), "skills.prepare", {"run_id": run_id, "skills": skills}, 15,
+        )
+
+    async def collect_skill_candidates(self, worker_id: str, run_id: str) -> dict:
+        return await self._get_worker(worker_id, run_id).request(
+            secrets.token_hex(16), "skills.collect", {"run_id": run_id}, 15,
+        )
+
     async def release(self, worker_id: str, run_id: str) -> None:
         reservation = self._reservations.get(worker_id)
         if reservation is None or reservation.run_id != run_id:

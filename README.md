@@ -2,6 +2,8 @@
 
 Mini Harness 用同一个 Agent Core 操作后台 Chromium 或已授权的 macOS／Windows 桌面。模型每轮看到两个工具，`bash` 和 `computer_use`。同一次 Run 的浏览器、命令和文件都留在同一个 Worker。SQLite 保存会话、审批、工具轨迹和恢复状态，截图随工具结果回给支持视觉输入的模型。
 
+Agent 优先使用 Bash 处理文件、执行代码、访问网络和 API，以及发现和读取 Skill。需要直接观察或操作图形界面，或用户明确要求操作界面时，使用 `computer_use`。一次任务可以组合两个工具，例如通过浏览器导出文件，再用 Bash 处理。Bash 命令可指定 `timeout`，省略时默认 120 秒，并受 `HARNESS_MAX_TOOL_SECONDS` 上限约束。
+
 ## 启动本地桌面版
 
 在 macOS 或 Windows 的已登录桌面中，先运行 `python -m pip install -e '.[desktop]'`。在环境变量或 `.harness/local.env` 中配置 `HARNESS_API_TOKEN` 和 `HARNESS_WORKER_SECRET`，可以用 `python -c 'import secrets; print(secrets.token_urlsafe(32))'` 各生成一次。然后运行：
@@ -57,15 +59,21 @@ Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromi
 
 macOS 需为操作当前桌面的进程授予屏幕录制和辅助功能权限。Windows Worker 应从已登录、未锁屏的桌面启动。当前桌面的控制使用主屏幕坐标，键入支持 ASCII。桌面文件选择对话框可以通过坐标和键盘操作。浏览器选择器及自动下载上传适用于云端浏览器。
 
+macOS 截图需要在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中授权启动 Worker 的应用，例如终端。授权后，从同一个应用重新启动 Mini Harness 或独立桌面 Worker。
+
+桌面和云端浏览器都支持截图、单击、双击、右键点击、移动指针、拖动、输入文本、按键和滚动。拖动使用 `x`、`y`、`end_x`、`end_y`。滚动使用 `direction` 和 `amount`，单位为像素，Windows 桌面会换算为近似的滚轮步数。已有的 `press` 和 `dx`／`dy` 调用也可以继续使用。
+
 运行 `python -m workers.desktop --pause` 可暂停 Worker。操作当前桌面时，也可以把鼠标移至主屏幕角落触发暂停。用 `python -m workers.desktop --resume` 解除本地暂停。结束 Worker 进程会断开远程控制。
 
 远程连接应使用 TLS。服务端可用 `HARNESS_WORKER_SECRETS` 的 JSON 映射为每个 Worker 配置独立密钥。WebSocket 通过双向 HMAC 握手认证，明文 WebSocket 只用于本机开发或专用 Docker 网络。
 
 ## Skill 学习与复用
 
-1. 对已完成的 Run 执行 `mini-harness learn RUN_ID`，让模型从轨迹提出一个 `SKILL.md` 候选。
+启用 Bash 且支持 Skill 工作区的 Worker 会将当前环境中已通过评测的 active Skill 放入运行目录的 `.mini-harness/skills/active/`，索引位于其中的 `index.json`。Agent 可以通过 Bash 读取对应的 `<name>/SKILL.md`，也可将可复用的流程或改进写入 `.mini-harness/skills/candidates/<name>/SKILL.md`。Run 成功结束时，Harness 校验并收录候选。候选需要通过评测并经明确批准后才能用于后续任务。旧 Worker 和未启用 Bash 的 Worker 继续接收匹配的 Skill 指引。
+
+1. 也可对已完成的 Run 执行 `mini-harness learn RUN_ID`，让模型从轨迹提出一个 `SKILL.md` 候选。
 2. 用 `mini-harness evaluate NAME VERSION cloud-browser` 在目标环境评测。
-3. 检查候选和评测结果，运行 `mini-harness publish NAME VERSION --yes` 发布。后续任务按关键词加载适用于当前环境的已验证版本。
+3. 检查候选和评测结果，运行 `mini-harness publish NAME VERSION --yes` 发布。后续任务可使用适用于当前环境的已验证版本。
 4. 用 `mini-harness skills --environment macos-desktop` 查看平台状态，用 `mini-harness rollback NAME VERSION --yes` 恢复已验证的历史版本。
 
 评测依赖任务所需的独立环境和验收条件。部署时通过 `HARNESS_SKILL_EVALUATOR=package.module:function` 配置可信评测入口，或用 `create_app(settings, skill_evaluator=...)` 注入。入口是异步函数，接收 `(skill, environment)`，在隔离的评测 Worker 上运行验收任务，再返回包含布尔字段 `passed` 的 JSON 字典。只有通过当前环境评测的 Skill 才会被用于该环境，未评测的平台会显示为 `untested`。默认启动不注册评测入口。版本文件位于 `HARNESS_DATA_DIR/skills/versions`，生命周期和版本元数据保存在 SQLite。

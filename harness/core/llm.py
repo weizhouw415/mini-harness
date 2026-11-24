@@ -40,7 +40,16 @@ class OpenAICompatible:
                 raise TypeError("Invalid assistant message")
             return {**message, "_usage": body.get("usage")}
         except httpx.HTTPStatusError as error:
-            raise ModelError(f"Model service returned HTTP {error.response.status_code}.") from error
+            detail = ""
+            try:
+                body = error.response.json()
+                if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                    message = body["error"].get("message")
+                    if isinstance(message, str):
+                        detail = " " + message[:500]
+            except ValueError:
+                pass
+            raise ModelError(f"Model service returned HTTP {error.response.status_code}.{detail}") from error
         except httpx.RequestError as error:
             raise ModelError(f"Model request failed ({type(error).__name__}).") from error
         except (KeyError, IndexError, TypeError, ValueError) as error:

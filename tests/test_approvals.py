@@ -26,7 +26,8 @@ class ApprovalWorker:
 
     async def acquire(self, worker_id, run_id, workspace_id, *, on_reserved=None):
         cloud = self.environment == "cloud-browser"
-        actions = ["observe", "screenshot", "scroll", "click", "type", "press"]
+        actions = ["observe", "screenshot", "scroll", "click", "double_click", "right_click",
+                   "move", "drag", "type", "key", "press"]
         if cloud:
             actions += ["navigate", "download", "upload"]
         connection = SimpleNamespace(
@@ -216,6 +217,33 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         capabilities = {"environment": "macos-desktop", "computer_targets": {"desktop": ["click"]}}
         with self.assertRaisesRegex(ValueError, "does not support computer target: browser"):
             Agent._route_computer({"action": "click", "target": "browser", "x": 8, "y": 7}, capabilities)
+
+    async def test_directional_scroll_only_auto_approves_short_browser_scrolls_without_coordinates(self):
+        await self.check_approvals([
+            ("computer_use", {"action": "scroll", "direction": "up", "amount": 420}),
+            ("computer_use", {"action": "scroll", "direction": "right", "amount": 4_001}),
+            ("computer_use", {"action": "scroll", "direction": "down", "amount": 20, "x": 8, "y": 7}),
+            ("computer_use", {"action": "drag", "x": 8, "y": 7, "end_x": 16, "end_y": 14}),
+        ], pauses=(1, 2, 3), automatic=(0,))
+
+    def test_tool_arguments_validate_gesture_fields_and_keep_the_reviewed_timeout(self):
+        agent = Agent(Settings(), None, None, None, None)
+        bash = {"name": "bash", "arguments": '{"command": "pwd"}'}
+        self.assertEqual(agent._arguments(bash), {"command": "pwd", "timeout": 120})
+        old_request = {"arguments": {"command": "pwd", "timeout": 30}}
+        self.assertEqual(agent._arguments(bash, old_request), old_request["arguments"])
+        capped_agent = Agent(Settings(max_tool_seconds=60), None, None, None, None)
+        self.assertEqual(capped_agent._arguments(bash)["timeout"], 60)
+
+        invalid_actions = [
+            {"action": "drag", "x": 8, "y": 7, "end_x": 16},
+            {"action": "key"},
+            {"action": "scroll", "direction": "up"},
+            {"action": "scroll", "direction": "down", "amount": 10, "dy": 10},
+        ]
+        for args in invalid_actions:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                agent._arguments({"name": "computer_use", "arguments": json.dumps(args)})
 
     async def test_manual_allow_and_cloud_bash_trust(self):
         steps = [("bash", {"command": "printf done > report.txt"})]

@@ -376,10 +376,71 @@ main {
 }
 
 .task, .turn-error, .message:not(.markdown) { white-space: pre-wrap; overflow-wrap: anywhere; }
-.turn > .trace, .turn > .turn-answer { grid-column: 2; min-width: 0; }
-.turn > .trace, .turn:not(:has(> .trace)) > .turn-answer { grid-row: 2; }
+.turn > .turn-response, .turn > .turn-answer { grid-area: 2 / 2; min-width: 0; }
+.turn-response { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
 .turn-answer:empty { display: none; }
 .turn-answer .message { margin: 0; overflow-wrap: anywhere; font-size: 15px; }
+
+.reasoning {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--side);
+  color: var(--muted);
+}
+
+.reasoning-summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 7px 13px;
+  border-radius: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.reasoning-summary::-webkit-details-marker { display: none; }
+.reasoning-summary:hover { background: var(--soft); }
+.reasoning[open] > .reasoning-summary { border-radius: 13px 13px 0 0; }
+.reasoning-summary > .trace-icon { margin-inline-start: auto; transition: transform 160ms ease; }
+.reasoning[open] > .reasoning-summary > .trace-icon { transform: rotate(90deg); }
+
+.reasoning-symbol {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--accent);
+}
+
+.reasoning-symbol > .trace-icon { width: 14px; height: 14px; }
+.reasoning-title { color: var(--ink); font-size: 13px; font-weight: 650; white-space: nowrap; }
+.reasoning-preview { min-width: 0; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.reasoning[open] .reasoning-preview { display: none; }
+
+.reasoning-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 13px 13px;
+  background: var(--surface);
+}
+
+.reasoning-segment {
+  min-width: 0;
+  padding-inline-start: 12px;
+  border-inline-start: 2px solid var(--line);
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.reasoning-segment:not(.markdown) { white-space: pre-wrap; }
 
 .turn-status {
   width: fit-content;
@@ -997,6 +1058,8 @@ dialog input:not([type="checkbox"]) {
 .trace-record pre { background: var(--canvas); }
 
 @media (max-width: 480px) {
+  .reasoning-summary { padding-inline: 9px; gap: 6px; }
+  .reasoning-body { padding-inline: 10px; }
   .trace-summary { padding-inline: 9px; gap: 6px; }
   .trace-body { padding-inline: 8px; }
   .trace-step-summary, .trace-entry { padding-inline: 5px; gap: 7px; }

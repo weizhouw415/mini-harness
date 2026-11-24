@@ -4,6 +4,7 @@ import ctypes
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,12 +13,18 @@ from pathlib import Path
 
 from harness.core.approval_shell import is_safe_bash
 from harness.execution.protocol import MAX_IMAGE_BYTES
-from workers.common.actions import integer_field, text_field
+from workers.common.actions import GUI_ACTIONS, point_fields, scroll_deltas, text_field
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
+from workers.common.skill_workspace import collect_skill_candidates, prepare_skill_workspace
 
 
-ACTIONS = ("screenshot", "observe", "click", "type", "scroll", "press")
+ACTIONS = (*GUI_ACTIONS, "observe", "press")
+CLICK_METHODS = {"click": "click", "double_click": "doubleClick", "right_click": "rightClick"}
+WINDOWS_WHEEL = 0x0800
+WINDOWS_HORIZONTAL_WHEEL = 0x1000
+WINDOWS_WHEEL_DELTA = 120
+WINDOWS_PIXELS_PER_NOTCH = 120
 KEY_ALIASES = {
     "alt": "alt", "arrowdown": "down", "arrowleft": "left", "arrowright": "right", "arrowup": "up",
     "backspace": "backspace", "control": "ctrl", "delete": "delete", "enter": "enter", "escape": "esc",
@@ -31,6 +38,7 @@ class Run:
     path: Path
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     closed: bool = False
+    skill_workspace_prepared: bool = False
 
 
 class WorkerBackend:
@@ -53,7 +61,7 @@ class WorkerBackend:
         actions = list(ACTIONS) if self.desktop_enabled else []
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
-            "safe_bash_path": True,
+            "safe_bash_path": True, "skill_workspace": self.bash_enabled and self.desktop_enabled,
             "computer": self.desktop_enabled, "download": False, "upload": False,
             "actions": actions, "computer_targets": {"desktop": actions},
         }
@@ -88,6 +96,28 @@ class WorkerBackend:
         except KeyError:
             raise ValueError("Unknown run") from None
 
+    async def prepare_skill_workspace(self, run_id: str, skills: list[dict]) -> None:
+        if not self.bash_enabled:
+            raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
+        run = self._get_run(run_id)
+        async with run.lock:
+            self.check_available()
+            if run.closed:
+                raise ValueError("Run is closed")
+            if not run.skill_workspace_prepared:
+                prepare_skill_workspace(run.path, skills)
+                run.skill_workspace_prepared = True
+
+    async def collect_skill_candidates(self, run_id: str) -> dict:
+        if not self.bash_enabled:
+            raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
+        run = self._get_run(run_id)
+        async with run.lock:
+            self.check_available()
+            if run.closed or not run.skill_workspace_prepared:
+                raise ValueError("Run has no available skill workspace")
+            return collect_skill_candidates(run.path)
+
     def _get_gui(self):
         if self._gui is None:
             import pyautogui
@@ -97,15 +127,95 @@ class WorkerBackend:
         return self._gui
 
     @staticmethod
-    def _point(gui, action: dict) -> tuple[int, int]:
-        x, y = integer_field(action, "x"), integer_field(action, "y")
+    def _point(gui, action: dict, x_name: str = "x", y_name: str = "y") -> tuple[int, int]:
+        x, y = point_fields(action, x_name, y_name)
         if not gui.onScreen(x, y):
             raise ValueError("Coordinates are outside the primary screen")
         return x, y
 
+    def _drag(self, gui, action: dict) -> None:
+        start = self._point(gui, action)
+        end = self._point(gui, action, "end_x", "end_y")
+        if start in gui.FAILSAFE_POINTS or end in gui.FAILSAFE_POINTS:
+            raise ValueError("Drag coordinates must avoid the mouse-corner fail-safe points")
+        gui.mouseDown(*start, button="left")
+        try:
+            gui.dragTo(*end, duration=0.3, button="left", mouseDownUp=False)
+        finally:
+            try:
+                gui.mouseUp(button="left")
+            except gui.FailSafeException:
+                # Release the held button at the current position before pausing.
+                with contextlib.suppress(Exception):
+                    gui.platformModule._mouseUp(*gui.position(), "left")
+                raise
+
+    def _scroll(self, gui, action: dict) -> None:
+        dx, dy = scroll_deltas(action)
+        if "x" in action or "y" in action:
+            gui.moveTo(*self._point(gui, action))
+            gui.failSafeCheck()
+        if "direction" in action:
+            if sys.platform == "darwin":
+                import Quartz
+
+                event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, -dy, dx)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            else:
+                # Windows scroll distance is set by each application and wheel settings.
+                delta = dx or -dy
+                notches = max(1, round(abs(delta) / WINDOWS_PIXELS_PER_NOTCH))
+                wheel_delta = WINDOWS_WHEEL_DELTA * (notches if delta > 0 else -notches)
+                event = WINDOWS_HORIZONTAL_WHEEL if dx else WINDOWS_WHEEL
+                ctypes.windll.user32.mouse_event(event, 0, 0, wheel_delta, 0)
+            return
+        if dx and sys.platform == "win32":
+            ctypes.windll.user32.mouse_event(WINDOWS_HORIZONTAL_WHEEL, 0, 0, dx * WINDOWS_WHEEL_DELTA, 0)
+        elif dx:
+            gui.hscroll(dx)
+        if dy:
+            gui.scroll(-dy)
+
     @staticmethod
-    def _screenshot(gui) -> dict:
-        image = gui.screenshot()
+    def _macos_capture_error(detail: str) -> Exception:
+        import Quartz
+
+        preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        if preflight is not None and not preflight():
+            return PermissionError(
+                "macOS has not authorized the desktop worker to capture the screen. "
+                "Enable Screen & System Audio Recording for the app that launches Mini Harness "
+                "in System Settings → Privacy & Security, then relaunch from that app."
+            )
+        return RuntimeError(f"macOS screen capture failed: {detail}")
+
+    @classmethod
+    def _macos_screenshot(cls):
+        # Pillow's macOS grab opens its temporary file even if screencapture failed.
+        with tempfile.TemporaryDirectory(prefix="mini-harness-screen-") as directory:
+            path = Path(directory) / "screen.png"
+            try:
+                result = subprocess.run(
+                    ["/usr/sbin/screencapture", "-x", "-m", "-t", "png", str(path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    encoding="utf-8", errors="replace", timeout=15,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("macOS screen capture timed out after 15 seconds.") from error
+            if result.returncode:
+                detail = result.stderr.strip()[:300] or f"screencapture exited with code {result.returncode}"
+                raise cls._macos_capture_error(detail)
+            from PIL import Image
+
+            try:
+                with Image.open(path, formats=["PNG"]) as captured:
+                    return captured.copy()
+            except OSError as error:
+                raise cls._macos_capture_error("screencapture did not produce a readable PNG") from error
+
+    @classmethod
+    def _screenshot(cls, gui) -> dict:
+        image = cls._macos_screenshot() if sys.platform == "darwin" else gui.screenshot()
         width, height = gui.size()
         if image.size != (width, height):
             image = image.resize((width, height))
@@ -146,8 +256,12 @@ class WorkerBackend:
                 gui.failSafeCheck()
                 if name in {"screenshot", "observe"}:
                     return self._screenshot(gui)
-                if name == "click":
-                    gui.click(*self._point(gui, action))
+                if name in CLICK_METHODS:
+                    getattr(gui, CLICK_METHODS[name])(*self._point(gui, action))
+                elif name == "move":
+                    gui.moveTo(*self._point(gui, action))
+                elif name == "drag":
+                    self._drag(gui, action)
                 elif name == "type":
                     value = text_field(action, "text", allow_empty=True, limit=4096)
                     if any(not (32 <= ord(char) < 127 or char in "\n\t") for char in value):
@@ -158,16 +272,8 @@ class WorkerBackend:
                             raise ValueError("Run is closed")
                         gui.write(value[start:start + 64])
                 elif name == "scroll":
-                    if "x" in action or "y" in action:
-                        gui.moveTo(*self._point(gui, action))
-                    dx, dy = integer_field(action, "dx", default=0), integer_field(action, "dy", default=0)
-                    if dx and sys.platform == "win32":
-                        ctypes.windll.user32.mouse_event(0x01000, 0, 0, dx * 120, 0)
-                    elif dx:
-                        gui.hscroll(dx)
-                    if dy:
-                        gui.scroll(-dy)
-                elif name == "press":
+                    self._scroll(gui, action)
+                elif name in {"key", "press"}:
                     self._press(gui, text_field(action, "key", limit=80))
             except gui.FailSafeException as exc:
                 self.pause()

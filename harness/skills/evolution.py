@@ -64,10 +64,12 @@ async def learn_skill(
                     "and Markdown instructions, or NO_SKILL if the trace has no applicable workflow. "
                     "Include name (lowercase kebab-case), description, an unused semantic version, "
                     "and environments as a YAML list when known. Supported environment labels are "
-                    "cloud-browser, macos-desktop, and windows-desktop. Existing skill versions are "
-                    "supplied so a related skill can receive a new revision. Omit credentials, "
-                    "private data, concrete user files, and environment-specific values. Report "
-                    "reusable steps and observable checks. Do not claim an environment was tested."
+                    "cloud-browser, macos-desktop, and windows-desktop. Prefer revising a related "
+                    "existing skill over creating a duplicate. Include reusable steps, prerequisites, "
+                    "verification, failure handling, and relevant environment requirements. Omit "
+                    "credentials, private data, concrete user files, and task-specific values. "
+                    "Never propose changing harness core, tool permissions, or security policies. "
+                    "Do not claim an environment was tested."
                 ),
             },
             {

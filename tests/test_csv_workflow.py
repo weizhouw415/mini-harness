@@ -41,6 +41,9 @@ environments:
 
 {SKILL_GUIDANCE}
 """
+CSV_SKILL_PATH = ".mini-harness/skills/active/csv-inventory/SKILL.md"
+CSV_CANDIDATE_DIR = ".mini-harness/skills/candidates/csv-inventory"
+REVISED_CSV_SKILL = CSV_SKILL.replace("version: 1.0.0", "version: 1.1.0") + "\nVerify that the upload succeeds.\n"
 
 PROCESS_INVENTORY = """python3 - <<'PY'
 import csv
@@ -69,7 +72,16 @@ def csv_calls(fixture_url: str):
 
 class ScriptedModel:
     def __init__(self, fixture_url: str):
-        self.calls = csv_calls(fixture_url)
+        calls = csv_calls(fixture_url)
+        self.calls = {
+            CSV_TASK: calls,
+            CSV_FOLLOWUP: [
+                ("bash", {"command": f"cat {CSV_SKILL_PATH}"}),
+                *calls,
+                ("bash", {"command": f"mkdir -p {CSV_CANDIDATE_DIR} && "
+                          f"cat > {CSV_CANDIDATE_DIR}/SKILL.md <<'EOF'\n{REVISED_CSV_SKILL}EOF"}),
+            ],
+        }
         self.next_call = {CSV_TASK: 0, CSV_FOLLOWUP: 0}
         self.saw_image = False
         self.saw_previous_response = False
@@ -88,7 +100,7 @@ class ScriptedModel:
         task = next(message["content"] for message in reversed(messages)
                     if message["role"] == "user" and isinstance(message.get("content"), str))
         index = self.next_call[task]
-        if index == 2:
+        if index == (3 if task == CSV_FOLLOWUP else 2):
             self.saw_image |= any(
                 isinstance(message.get("content"), list)
                 and any(
@@ -103,11 +115,14 @@ class ScriptedModel:
             self.saw_previous_response = any(
                 message["role"] == "assistant" and message.get("content") == CSV_RESULT for message in messages
             )
-            self.saw_reusable_skill = SKILL_GUIDANCE in messages[0]["content"]
-        if index == len(self.calls):
+        if task == CSV_FOLLOWUP and index == 1:
+            result = json.loads(messages[-1]["content"])
+            self.saw_reusable_skill = result.get("exit_code") == 0 and SKILL_GUIDANCE in result.get("stdout", "")
+        calls = self.calls[task]
+        if index == len(calls):
             return {"role": "assistant", "content": CSV_RESULT}
 
-        name, arguments = self.calls[index]
+        name, arguments = calls[index]
         self.next_call[task] += 1
         return tool_call(f"csv-call-{index}", name, arguments)
 
@@ -237,8 +252,8 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
                 events = (await client.get(f"/v1/runs/{first_run['id']}/events")).raise_for_status().json()
                 event_types = [event["type"] for event in events]
-                self.assertEqual(event_types.count("tool_call"), len(model.calls))
-                self.assertEqual(event_types.count("tool_result"), len(model.calls))
+                self.assertEqual(event_types.count("tool_call"), len(model.calls[CSV_TASK]))
+                self.assertEqual(event_types.count("tool_result"), len(model.calls[CSV_TASK]))
                 self.assertEqual(first_run["worker_id"], WORKER_ID)
 
                 screenshot = next(
@@ -265,6 +280,9 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(followup["session_id"], first_run["session_id"])
                 self.assertTrue(model.saw_previous_response)
                 self.assertTrue(model.saw_reusable_skill)
+                index = (await client.get("/v1/skills")).raise_for_status().json()
+                self.assertEqual({skill["version"]: skill["state"] for skill in index},
+                                 {"1.0.0": "active", "1.1.0": "candidate"})
                 await eventually(lambda: len(fixture.uploads) == 2)
                 self.assertEqual(fixture.login_count, 2)
 

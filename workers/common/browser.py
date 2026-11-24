@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from workers.common.actions import integer_field, text_field
+from workers.common.actions import GUI_ACTIONS, point_fields, scroll_deltas, text_field
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
 
-BROWSER_ACTIONS = ("screenshot", "observe", "navigate", "click", "type", "scroll", "press", "download", "upload")
+BROWSER_ACTIONS = (*GUI_ACTIONS, "observe", "navigate", "press", "download", "upload")
 VIEWPORT = {"width": 1280, "height": 720}
+CLICK_OPTIONS = {"double_click": {"click_count": 2}, "right_click": {"button": "right"}}
 
 
 @dataclass
@@ -67,10 +68,22 @@ class BrowserController:
 
     @staticmethod
     async def _click(page: Page, action: dict) -> None:
+        options = CLICK_OPTIONS.get(action["action"], {})
         if "selector" in action:
-            await page.locator(text_field(action, "selector")).click()
+            await page.locator(text_field(action, "selector")).click(**options)
         else:
-            await page.mouse.click(integer_field(action, "x"), integer_field(action, "y"))
+            await page.mouse.click(*point_fields(action), **options)
+
+    @staticmethod
+    async def _drag(page: Page, action: dict) -> None:
+        start = point_fields(action)
+        end = point_fields(action, "end_x", "end_y")
+        await page.mouse.move(*start)
+        await page.mouse.down()
+        try:
+            await page.mouse.move(*end, steps=10)
+        finally:
+            await page.mouse.up()
 
     async def _download(self, workspace: Path, page: Page, action: dict) -> dict:
         destination = self._workspace_path(workspace, text_field(action, "path")) if "path" in action else None
@@ -109,8 +122,12 @@ class BrowserController:
                 raise ValueError("URL must use HTTP or HTTPS")
             response = await page.goto(address, wait_until="domcontentloaded")
             return {"url": page.url, "status": response.status if response else None}
-        if name == "click":
+        if name in {"click", "double_click", "right_click"}:
             await self._click(page, action)
+        elif name == "move":
+            await page.mouse.move(*point_fields(action))
+        elif name == "drag":
+            await self._drag(page, action)
         elif name == "type":
             value = text_field(action, "text", allow_empty=True, limit=100_000)
             if "selector" in action:
@@ -118,10 +135,11 @@ class BrowserController:
             else:
                 await page.keyboard.insert_text(value)
         elif name == "scroll":
+            dx, dy = scroll_deltas(action)
             if "x" in action or "y" in action:
-                await page.mouse.move(integer_field(action, "x"), integer_field(action, "y"))
-            await page.mouse.wheel(integer_field(action, "dx", default=0), integer_field(action, "dy", default=0))
-        elif name == "press":
+                await page.mouse.move(*point_fields(action))
+            await page.mouse.wheel(dx, dy)
+        elif name in {"key", "press"}:
             key = text_field(action, "key", limit=80)
             if "selector" in action:
                 await page.locator(text_field(action, "selector")).press(key)

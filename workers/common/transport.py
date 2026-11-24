@@ -90,6 +90,18 @@ class _Runtime:
                 self.active_run = None
                 self.call_ids.clear()
                 return {}
+            if method == "skills.prepare":
+                prepare = getattr(self.backend, "prepare_skill_workspace", None)
+                skills = params.get("skills")
+                if prepare is None or not isinstance(skills, list):
+                    raise ValueError("Worker skill workspace or snapshot is unavailable")
+                await prepare(run_id, skills)
+                return {}
+            if method == "skills.collect":
+                collect = getattr(self.backend, "collect_skill_candidates", None)
+                if collect is None:
+                    raise ValueError("Worker skill workspace is unavailable")
+                return await collect(run_id)
             if call_id in self.call_ids:
                 raise ValueError("Call ID already handled. Check the run trace for its outcome.")
             if len(self.call_ids) >= MAX_CALLS_PER_RUN:

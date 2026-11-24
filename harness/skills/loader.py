@@ -6,7 +6,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
 from time import time
 from uuid import uuid4
@@ -17,6 +17,8 @@ from .matcher import rank_skills
 
 ENVIRONMENTS = frozenset({"cloud-browser", "macos-desktop", "windows-desktop"})
 MAX_SKILL_BYTES = 24_000
+MAX_WORKSPACE_SKILLS = 32
+MAX_WORKSPACE_SKILL_BYTES = 128_000
 EVALUATION_LEASE_SECONDS = 300
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 VERSION_PATTERN = re.compile(
@@ -55,6 +57,10 @@ def parse_skill(content: str) -> dict:
     description = fields.get("description")
     if not isinstance(description, str) or not description.strip() or len(description) > 1024:
         raise SkillError("Skill description must contain 1–1024 characters")
+    try:
+        description.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SkillError("Skill description must be valid UTF-8") from exc
     metadata = fields.get("metadata", {})
     if not isinstance(metadata, dict):
         raise SkillError("Skill metadata must be a mapping")
@@ -125,12 +131,17 @@ class SkillStore:
         return self.path / "versions" / name / version / "SKILL.md"
 
     def create_candidate(self, content: str) -> dict:
-        skill = parse_skill(content)
+        return self._create_candidate(parse_skill(content))
+
+    def _create_candidate(self, skill: dict, *, accept_existing: bool = False) -> dict:
         name, version = skill["name"], skill["version"]
         with self._connection(write=True) as db:
-            if db.execute(
-                "SELECT 1 FROM versions WHERE name = ? AND version = ?", (name, version)
-            ).fetchone():
+            existing = db.execute(
+                "SELECT content FROM versions WHERE name = ? AND version = ?", (name, version)
+            ).fetchone()
+            if existing is not None:
+                if accept_existing and existing["content"] == skill["content"]:
+                    return self._get(db, name, version)
                 raise SkillError(f"Skill {name} version {version} already exists")
             db.execute(
                 """
@@ -236,12 +247,10 @@ class SkillStore:
             )
             return [self._record(db, row, environment=environment) for row in rows]
 
-    def match(self, query: str, environment: str, *, limit: int = 3) -> list[dict]:
-        self._environment(environment)
-        if limit < 1:
-            return []
-        with self._connection() as db:
-            rows = db.execute(
+    @staticmethod
+    def _verified_active(db: sqlite3.Connection, environment: str) -> list[dict]:
+        return [
+            dict(row) for row in db.execute(
                 """
                 SELECT name, version, description FROM versions JOIN evaluations USING (name, version)
                 WHERE state = 'active' AND environment = ? AND status = 'passed'
@@ -249,10 +258,63 @@ class SkillStore:
                 """,
                 (environment,),
             )
+        ]
+
+    def match(self, query: str, environment: str, *, limit: int = 3) -> list[dict]:
+        self._environment(environment)
+        if limit < 1:
+            return []
+        with self._connection() as db:
             return [
                 self._get(db, skill["name"], skill["version"], environment=environment)
-                for skill in rank_skills(query, [dict(row) for row in rows])[:limit]
+                for skill in rank_skills(query, self._verified_active(db, environment))[:limit]
             ]
+
+    def workspace_snapshot(self, environment: str, query: str) -> list[dict]:
+        """Export verified active skill documents for Bash discovery on one worker."""
+        self._environment(environment)
+        with self._connection() as db:
+            eligible = self._verified_active(db, environment)
+            matches = rank_skills(query, eligible)
+            matched_names = {item["name"] for item in matches}
+            snapshot = []
+            remaining = MAX_WORKSPACE_SKILL_BYTES
+            for item in matches + [item for item in eligible if item["name"] not in matched_names]:
+                if len(snapshot) == MAX_WORKSPACE_SKILLS:
+                    break
+                if environment == "windows-desktop" and PureWindowsPath(item["name"]).is_reserved():
+                    continue
+                content = db.execute(
+                    "SELECT content FROM versions WHERE name = ? AND version = ?",
+                    (item["name"], item["version"]),
+                ).fetchone()["content"]
+                skill = {**item, "content": content}
+                size = sum(len(value.encode("utf-8")) for value in skill.values())
+                if size <= remaining:
+                    snapshot.append(skill)
+                    remaining -= size
+            return snapshot
+
+    def import_workspace_candidates(self, candidates: list) -> dict[str, int]:
+        """Validate staged drafts and import them through the ordinary candidate lifecycle."""
+        if not isinstance(candidates, list):
+            return {"accepted": 0, "rejected": 1}
+        accepted = 0
+        remaining = MAX_WORKSPACE_SKILL_BYTES
+        for item in candidates[:MAX_WORKSPACE_SKILLS]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                skill = parse_skill(item.get("content"))
+                size = len(skill["content"].encode("utf-8"))
+                if skill["name"] != item.get("name") or size > remaining:
+                    continue
+                remaining -= size
+                self._create_candidate(skill, accept_existing=True)
+            except SkillError:
+                continue
+            accepted += 1
+        return {"accepted": accepted, "rejected": len(candidates) - accepted}
 
     def _activate(self, name: str, version: str, *, approved: bool, from_state: str) -> dict:
         if approved is not True:
