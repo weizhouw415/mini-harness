@@ -1,9 +1,18 @@
+import asyncio
+import os
+import tempfile
 import unittest
+from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
-from harness.execution.router import WorkerManager, WorkerUnavailable
+from PIL import Image
+
+from harness.execution.protocol import ARTIFACT_CHUNK_BYTES, decode
+from harness.execution.router import WorkerConnection, WorkerManager, WorkerUnavailable
 from workers.common.transport import _Runtime
+from workers.desktop.worker import WorkerBackend
 
 
 class WorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
@@ -68,3 +77,143 @@ class WorkerTransportTest(unittest.IsolatedAsyncioTestCase):
             await runtime.execute("resume-2", "run.resume", {"run_id": "run-1", "workspace_id": "ws-2"})
         await runtime.execute("resume-3", "run.resume", {"run_id": "run-1", "workspace_id": "ws-1"})
         backend.open_run.assert_awaited_once_with("run-1", "ws-1")
+
+    @unittest.skipIf(os.name == "nt", "Uses the POSIX desktop Bash executable")
+    async def test_bash_artifacts_round_trip_over_worker_frames(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend = WorkerBackend(root)
+            backend.bash_enabled = True
+            backend.check_available = lambda: None
+            runtime = _Runtime(backend)
+            manager = WorkerManager("test-worker-secret")
+
+            async def request(call_id, method, params, timeout):
+                return await asyncio.wait_for(runtime.execute(call_id, method, params), timeout)
+
+            worker = SimpleNamespace(worker_id="desktop", capabilities=backend.capabilities(),
+                                     request=request)
+            manager._workers[worker.worker_id] = worker
+            manager._known_workers[worker.worker_id] = worker.capabilities
+            await manager.acquire(worker.worker_id, "run-1", "workspace-1")
+            help_result = await manager.bash(
+                worker.worker_id, "run-1", "help",
+                "harness view --help; harness register --help; harness computer --help", 5,
+            )
+            self.assertIn("--crop", help_result["stdout"])
+            self.assertIn("harness register FILE", help_result["stdout"])
+            self.assertIn("Usage: harness computer", help_result["stdout"])
+            blocked = await manager.bash(
+                worker.worker_id, "run-1", "blocked", "true && harness computer click 5 5", 5,
+            )
+            self.assertEqual(blocked["exit_code"], 2)
+            self.assertIn("GUI approval", blocked["stderr"])
+
+            raster = BytesIO()
+            Image.new("RGB", (24, 30), "red").save(raster, "PNG")
+            original = b"z" * (ARTIFACT_CHUNK_BYTES + 1)
+            await manager.stage_artifact(worker.worker_id, "run-1", "uploads/input image.png", raster.getvalue())
+            await manager.stage_artifact(worker.worker_id, "run-1", "uploads/original.bin", original)
+            await manager.stage_artifact(worker.worker_id, "run-1", "uploads/empty.bin", b"")
+            workspace = backend._runs["run-1"].path
+            private = root / "private.txt"
+            private.write_text("This data belongs outside the workspace.")
+            (workspace / "outside").symlink_to(private)
+            (workspace / "linked").hardlink_to(private)
+
+            outgoing = AsyncMock()
+            await runtime.respond(outgoing, asyncio.Lock(), "call-1", "bash.execute", {
+                "run_id": "run-1", "timeout": 5,
+                "command": "cd uploads; harness view --crop 0,1,10,12 'input image.png'; "
+                           "harness register original.bin empty.bin ../outside ../linked; printf done",
+            })
+            metadata, *payloads = [call.args[0] for call in outgoing.send.await_args_list]
+            connection = WorkerConnection(worker.worker_id, {}, AsyncMock())
+            connection.websocket.receive.side_effect = [
+                {"type": "websocket.receive", "bytes": data} for data in payloads
+            ]
+            pending = asyncio.get_running_loop().create_future()
+            connection.pending["call-1"] = pending
+            await manager._receive_result(connection, decode(metadata))
+            result = pending.result()
+            self.assertEqual(result["stdout"], "done")
+            self.assertEqual(result["stderr"], "")
+            self.assertEqual(result["exit_code"], 0)
+            label, image, artifact, empty, *denied = result["content"]
+            self.assertIn("24 × 30", label["text"])
+            self.assertEqual(image["type"], "image")
+            self.assertEqual(image["source_path"], "uploads/input image.png")
+            with Image.open(BytesIO(image["data"])) as cropped:
+                self.assertEqual(cropped.size, (10, 12))
+            self.assertEqual(artifact["path"], "uploads/original.bin")
+            self.assertEqual(artifact["data"], original)
+            self.assertEqual(empty["data"], b"")
+            self.assertEqual([block["type"] for block in denied], ["text", "text"])
+            self.assertNotIn(private.read_text(), str(denied))
+            await runtime.close()
+
+    async def test_computer_cli_supports_desktop_without_bash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend = WorkerBackend(root)
+            backend.desktop_enabled = True
+            backend.bash_enabled = False
+            backend.check_available = Mock()
+            gui = Mock()
+            gui.size.return_value = (100, 80)
+            gui.onScreen.return_value = True
+            gui.FailSafeException = type("FailSafeException", (Exception,), {})
+            backend._get_gui = Mock(return_value=gui)
+            raster = BytesIO()
+            Image.new("RGB", (100, 80), "white").save(raster, "PNG")
+            backend._screenshot = Mock(return_value={
+                "image": raster.getvalue(), "mime_type": "image/png", "width": 100, "height": 80,
+            })
+            runtime = _Runtime(backend)
+            manager = WorkerManager("test-worker-secret")
+
+            async def request(call_id, method, params, timeout):
+                return await asyncio.wait_for(runtime.execute(call_id, method, params), timeout)
+
+            worker = SimpleNamespace(worker_id="desktop", capabilities=backend.capabilities(),
+                                     request=AsyncMock(side_effect=request))
+            manager._workers[worker.worker_id] = worker
+            manager._known_workers[worker.worker_id] = worker.capabilities
+            self.assertTrue(worker.capabilities["computer_cli"])
+            await manager.acquire(worker.worker_id, "run-1", "workspace-1")
+            info = await manager.computer_cli(
+                worker.worker_id, "run-1", "info", {"action": "screen_info"}, observe=False, output=None, timeout=7,
+            )
+            self.assertEqual(info, {"target": "desktop", "width": 100, "height": 80})
+            self.assertEqual(worker.request.await_args.args[-1], 7)
+            backend._screenshot.assert_not_called()
+
+            capture = await manager.computer_cli(
+                worker.worker_id, "run-1", "capture", {"action": "screenshot"}, observe=True, output="shots/ui.jpg",
+            )
+            backend._screenshot.assert_called_once_with(gui)
+            self.assertEqual(capture["image"], raster.getvalue())
+            self.assertEqual(capture["path"], "shots/ui.jpg")
+            self.assertEqual(capture["output_mime_type"], "image/jpeg")
+            workspace = backend._runs["run-1"].path
+            with Image.open(workspace / capture["path"]) as saved:
+                self.assertEqual((saved.format, saved.size), ("JPEG", (100, 80)))
+            if os.name != "nt":
+                private = root / "private.png"
+                private.write_bytes(b"private")
+                (workspace / "linked.png").symlink_to(private)
+                with self.assertRaisesRegex(ValueError, "regular workspace file"):
+                    await manager.computer_cli(
+                        worker.worker_id, "run-1", "linked", {"action": "screenshot"},
+                        observe=False, output="linked.png",
+                    )
+                self.assertEqual(private.read_bytes(), b"private")
+
+            backend._screenshot.side_effect = RuntimeError("capture failed")
+            moved = await manager.computer_cli(
+                worker.worker_id, "run-1", "move", {"action": "move", "x": 5, "y": 10},
+                observe=True, output=None,
+            )
+            gui.moveTo.assert_called_once_with(5, 10)
+            self.assertEqual(moved, {"ok": True, "observation_error": "capture failed"})
+            await runtime.close()

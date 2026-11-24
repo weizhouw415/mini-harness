@@ -1,6 +1,7 @@
 """Connect an execution backend to a Harness server over an outbound WebSocket."""
 
 import asyncio
+import base64
 import inspect
 import ipaddress
 import logging
@@ -13,6 +14,7 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from harness.execution.protocol import (
+    ARTIFACT_CHUNK_BYTES,
     HANDSHAKE_TIMEOUT,
     IMAGE_TYPES,
     MAX_CALLS_PER_RUN,
@@ -25,6 +27,7 @@ from harness.execution.protocol import (
     encode,
     is_identifier,
     is_nonce,
+    validate_artifact_response,
     verify_proof,
 )
 
@@ -102,6 +105,17 @@ class _Runtime:
                 if collect is None:
                     raise ValueError("Worker skill workspace is unavailable")
                 return await collect(run_id)
+            if method == "artifacts.stage":
+                stage = getattr(self.backend, "stage_artifact", None)
+                path, encoded = params.get("path"), params.get("data")
+                if (
+                    stage is None or not isinstance(path, str) or len(path) > 1024
+                    or not isinstance(encoded, str) or len(encoded) > 4 * ((ARTIFACT_CHUNK_BYTES + 2) // 3)
+                ):
+                    raise ValueError("Worker artifact workspace or upload chunk is invalid")
+                data = base64.b64decode(encoded, validate=True)
+                await stage(run_id, path, params.get("offset"), params.get("total"), data)
+                return {}
             if call_id in self.call_ids:
                 raise ValueError("Call ID already handled. Check the run trace for its outcome.")
             if len(self.call_ids) >= MAX_CALLS_PER_RUN:
@@ -115,10 +129,19 @@ class _Runtime:
                     raise ValueError("Bash timeout must be between 1 and 3600 seconds")
                 self.call_ids.add(call_id)
                 return await self.backend.bash(run_id, command, timeout)
-            if method == "computer.execute":
+            if method in {"computer.execute", "computer.cli"}:
                 action = params.get("action")
                 if not isinstance(action, dict):
                     raise ValueError("Computer action must be an object")
+                if method == "computer.cli":
+                    execute = getattr(self.backend, "computer_cli", None)
+                    observe, output = params.get("observe"), params.get("output")
+                    if execute is None or type(observe) is not bool or (
+                        output is not None and (not isinstance(output, str) or len(output) > 512)
+                    ):
+                        raise ValueError("Invalid computer CLI options")
+                    self.call_ids.add(call_id)
+                    return await execute(run_id, action, observe=observe, output=output)
                 self.call_ids.add(call_id)
                 return await self.backend.computer(run_id, action)
             raise ValueError("Unknown worker method")
@@ -132,6 +155,7 @@ class _Runtime:
         params: dict[str, Any],
     ) -> None:
         image = None
+        payloads = []
         try:
             result = dict(await self.execute(call_id, method, params))
             image = result.pop("image", None)
@@ -142,15 +166,32 @@ class _Runtime:
                 ):
                     raise ValueError("Worker screenshot exceeds the limit or has an unsupported format")
                 result["image_bytes"] = len(image)
+            if "content" in result:
+                blocks = []
+                for original in result["content"]:
+                    block = dict(original)
+                    if block.get("type") != "text":
+                        data = block.pop("data", None)
+                        if not isinstance(data, bytes):
+                            raise ValueError("Worker artifact is missing file data")
+                        block["data_bytes"] = len(data)
+                        payloads.append(data)
+                    blocks.append(block)
+                validate_artifact_response(blocks)
+                result["content"] = blocks
             response = encode({"id": call_id, "result": result})
         except Exception as exc:
             image = None
+            payloads.clear()
             response = encode({"id": call_id, "error": str(exc)[:1000] or type(exc).__name__})
         async with send_lock:
             with suppress(ConnectionClosed):
                 await websocket.send(response)
                 if image is not None:
                     await websocket.send(image)
+                for data in payloads:
+                    for offset in range(0, len(data), ARTIFACT_CHUNK_BYTES):
+                        await websocket.send(data[offset:offset + ARTIFACT_CHUNK_BYTES])
 
     async def close(self) -> None:
         tasks = tuple(self.pending)

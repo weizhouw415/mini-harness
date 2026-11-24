@@ -1,8 +1,16 @@
 # Mini Harness
 
-Mini Harness 用同一个 Agent Core 操作后台 Chromium 或已授权的 macOS／Windows 桌面。模型每轮看到两个工具，`bash` 和 `computer_use`。同一次 Run 的浏览器、命令和文件都留在同一个 Worker。SQLite 保存会话、审批、工具轨迹和恢复状态，截图随工具结果回给支持视觉输入的模型。
+## 核心设计
 
-Agent 优先使用 Bash 处理文件、执行代码、访问网络和 API，以及发现和读取 Skill。需要直接观察或操作图形界面，或用户明确要求操作界面时，使用 `computer_use`。一次任务可以组合两个工具，例如通过浏览器导出文件，再用 Bash 处理。Bash 命令可指定 `timeout`，省略时默认 120 秒，并受 `HARNESS_MAX_TOOL_SECONDS` 上限约束。
+Mini Harness 采用单工具架构。一个 Agent Loop 统一推理、执行和观察，模型通过一个执行入口调用 Worker 上的命令、程序和可复用技能。
+
+- **Bash 是唯一的模型执行接口。** 优先用命令、脚本、SDK 和 API 处理任务。
+- **CLI 封装能力。** `harness computer` 操作界面，`harness view` 检查产物，`harness register` 交付文件。Skill 和 Env 是同一命令体系里可继续扩展的入口，目前通过工作区技能索引和 Worker 能力声明发现。
+- **Artifact 承载感知。** 上传文件、截图和运行产物共享文件引用与多模态观察。支持视觉的模型可以直接查看画面，再据此验证和修正结果。
+- **Skills 沉淀可复用的能力。** 将经过验证的流程和脚本保存为技能，通过评测与审批后供后续任务使用。
+- **Harness 是稳定的运行时。** 运行时负责绑定 Worker、审批、工作区、事件记录和恢复。新能力可以通过 CLI、Skill 或脚本扩展，模型接口和 Agent Loop 保持稳定。
+
+同一次 Run 的浏览器、命令和文件留在同一个 Worker 中。SQLite 保存会话、审批、工具轨迹和恢复状态。Bash 命令可指定 `timeout`，默认 120 秒，并受 `HARNESS_MAX_TOOL_SECONDS` 上限约束。
 
 ## 启动本地桌面版
 
@@ -61,7 +69,26 @@ macOS 需为操作当前桌面的进程授予屏幕录制和辅助功能权限�
 
 macOS 截图需要在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中授权启动 Worker 的应用，例如终端。授权后，从同一个应用重新启动 Mini Harness 或独立桌面 Worker。
 
-桌面和云端浏览器都支持截图、单击、双击、右键点击、移动指针、拖动、输入文本、按键和滚动。拖动使用 `x`、`y`、`end_x`、`end_y`。滚动使用 `direction` 和 `amount`，单位为像素，Windows 桌面会换算为近似的滚轮步数。已有的 `press` 和 `dx`／`dy` 调用也可以继续使用。
+桌面和云端浏览器都支持截图、单击、双击、右键点击、移动指针、拖动、输入文本、按键和滚动。滚动量单位为像素，Windows 桌面会换算为近似的滚轮步数。
+
+### Computer CLI
+
+在 Run 的 Bash 工具中，每次提交一条独立的 `harness computer` 命令。Harness 解析参数后按具体界面动作审批，再调用同一 Worker 的图形后端。
+
+```bash
+harness computer --help
+harness computer screen-info
+harness computer screenshot --output screen.png
+harness computer click 500 300 --observe
+harness computer drag 100 200 500 600
+harness computer type 'Hello World'
+harness computer key Ctrl+S
+harness computer scroll down 500
+```
+
+`--observe` 会在动作后返回截图。`screenshot --output` 同时保存一份到工作区，后续 Bash 调用可用 `harness view screen.png` 查看。云端浏览器还支持 `navigate`、元素选择器和工作区文件上传下载。
+
+界面动作沿用截图、导航、鼠标、键盘及文件操作各自的审批规则。`HARNESS_TRUST_CLOUD_BASH` 适用于普通 Shell 命令，界面动作仍由图形审批判断。桌面 Bash 与 GUI 由 Worker 分别授权，启用桌面 Bash 后，Shell 命令以当前操作系统账号执行。
 
 运行 `python -m workers.desktop --pause` 可暂停 Worker。操作当前桌面时，也可以把鼠标移至主屏幕角落触发暂停。用 `python -m workers.desktop --resume` 解除本地暂停。结束 Worker 进程会断开远程控制。
 
@@ -86,7 +113,18 @@ macOS 截图需要在「系统设置 → 隐私与安全性 → 屏幕与系统�
 免 Token 连接只用于直接访问本机回环地址的浏览器页面，CLI 和外部 API 客户端仍使用 `HARNESS_API_TOKEN`。
 侧栏显示最近 100 个对话，包括通过 CLI 创建的会话。选中对话后可连续发送消息，点击「新建对话」可开始独立会话。
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。
-后续消息会携带此前已完成、失败或取消运行的完整事件记录。历史截图以轨迹中的附件引用保留，不会重新作为图片发送给模型；每次运行使用新的工作区和浏览器上下文。长对话可能超过模型服务的上下文限制。
+Harness 以流式方式向模型请求回复。模型返回的思考过程和正文会随生成进度显示，工具调用收齐后再审批和执行。模型请求的读取超时为 15 分钟，在等待下一段数据时计时。
+后续消息会携带此前已完成、失败或取消运行的事件记录，模型回复按合并后的完整消息回传。历史截图以轨迹中的附件引用保留，不会重新作为图片发送给模型；每次运行使用新的工作区和浏览器上下文。长对话可能超过模型服务的上下文限制。
+
+### 上传附件与查看产物
+
+通过输入框旁的附件按钮选择文件。每轮可上传 8 个文件，单个文件最多 20 MiB，合计最多 40 MiB。原件保存在服务端，并在该轮开始时复制到 Worker 的 `uploads/` 目录。模型会收到原件路径，并在前几步收到支持格式的图像预览或文本摘要。
+
+Agent 可以通过 Bash 执行 `harness view`，主动查看工作区内的文件。例如用 Playwright 生成 `preview.png`，再执行 `harness view preview.png`，模型就可以检查实际渲染效果。`harness view --help` 列出页面、工作表、视频帧和图像裁剪等选项。用 `harness register <文件路径>` 将原件交付给用户。两条命令在 Bash 调用结束时读取文件，并沿用现有的 Bash 审批模式。
+
+每轮对话显示已上传的文件，以及运行生成的预览和显式交付的文件。图片和文本可在页面中预览，其他原件可以下载。已登记文件随服务数据目录保留。PDF 预览需要 Poppler，SVG 渲染需要 `rsvg-convert`，Word 和 PowerPoint 的页面渲染需要在 Worker 上安装 LibreOffice，媒体预览需要 FFmpeg。模型视觉预览需要支持图像输入的 OpenAI 兼容模型。
+
+API 客户端可向 `POST /v1/uploads` 发送 `application/octet-stream` 原始文件，在 `X-File-Name` 中提供 URL 编码后的文件名，并将返回的 ID 作为 `upload_ids` 传给 `POST /v1/runs`。运行的文件列表和下载地址分别为 `GET /v1/runs/{id}/files` 和 `GET /v1/runs/{id}/files/{file_id}`。
 
 输入框下方的审批模式可以在运行中切换。已经开始的工具操作会继续执行，正在等待审批和还未执行的操作按新模式判断。没有运行中的任务时，所选模式用于下一条消息。
 

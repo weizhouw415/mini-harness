@@ -8,13 +8,15 @@ from ipaddress import ip_address
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
+from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOADS, file_name
 from harness.config import ModelConfig, Settings
 from harness.core.agent import Agent
 from harness.core.llm import ModelError, OpenAICompatible
@@ -24,10 +26,13 @@ from harness.storage.sqlite import Conflict, NotFound, RunStore
 
 
 class RunRequest(BaseModel):
-    task: str = Field(min_length=1, max_length=16_000)
+    task: str = Field(default="", max_length=16_000)
     session_id: str | None = None
     worker_id: str | None = None
     approval_mode: Literal["manual", "auto", "allow"] | None = None
+    upload_ids: list[Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]] = Field(
+        default_factory=list, max_length=MAX_UPLOADS,
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -220,17 +225,38 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     async def worker_list():
         return workers.list_workers()
 
+    @app.post("/v1/uploads", status_code=201, dependencies=control)
+    async def upload_file(request: Request, x_file_name: str = Header()):
+        try:
+            name = file_name(unquote(x_file_name, encoding="utf-8", errors="strict"))
+            if name.lower().startswith(".upload-"):
+                raise ValueError("This file name is reserved for uploads.")
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        if request.headers.get("content-type") != "application/octet-stream":
+            raise HTTPException(415, "Send the raw file as application/octet-stream.")
+        content = bytearray()
+        async for chunk in request.stream():
+            if len(content) + len(chunk) > MAX_FILE_BYTES:
+                raise HTTPException(413, "Each file may be up to 20 MiB.")
+            content.extend(chunk)
+        return await asyncio.to_thread(store.add_upload, name, bytes(content))
+
     def start(task: str, session_id: str | None, worker_id: str | None,
-              approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy"):
+              approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy",
+              upload_ids: list[str] | None = None):
+        if upload_ids and not task.strip():
+            task = "请查看我上传的附件。"
         if not task.strip() or len(task) > 16_000:
             raise HTTPException(422, "The task must contain 1 to 16000 characters.")
-        run = store.create(task, session_id, worker_id, approval_mode)
+        run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids)
         agent.schedule(run["id"])
-        return run
+        return store.get(run["id"], include_files=True)
 
     @app.post("/v1/runs", status_code=202, dependencies=control)
     async def start_run(request: RunRequest):
-        return start(request.task, request.session_id, request.worker_id, request.approval_mode or "legacy")
+        return start(request.task, request.session_id, request.worker_id, request.approval_mode or "legacy",
+                     request.upload_ids)
 
     @app.get("/v1/runs", dependencies=control)
     async def list_runs():
@@ -246,11 +272,23 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
 
     @app.get("/v1/runs/{run_id}", dependencies=control)
     async def get_run(run_id: str):
-        return store.get(run_id)
+        return store.get(run_id, include_files=True)
+
+    @app.get("/v1/runs/{run_id}/files", dependencies=control)
+    async def run_files(run_id: str):
+        return store.files(run_id)
+
+    @app.get("/v1/runs/{run_id}/files/{file_id}", dependencies=control)
+    async def download_file(run_id: str, file_id: str):
+        file, path = store.run_file(run_id, file_id)
+        return FileResponse(path, filename=file["name"], media_type="application/octet-stream", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        })
 
     @app.get("/v1/runs/{run_id}/events", dependencies=control)
     async def get_events(run_id: str, after: int = 0):
-        return [event for event in store.events(run_id) if event["seq"] > after]
+        return store.events(run_id, after=after)
 
     @app.get("/v1/runs/{run_id}/artifacts/{name}", dependencies=control)
     async def artifact(run_id: str, name: str):
@@ -342,7 +380,7 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
             reply = await llm.complete(messages, [])
             return reply.get("content")
 
-        return await learn_skill(skills, {**run, "events": store.events(run_id)}, generate)
+        return await learn_skill(skills, {**run, "events": store.events(run_id, include_deltas=False)}, generate)
 
     @app.post("/v1/skills/{name}/{version}/evaluate", dependencies=protected)
     async def evaluate(name: str, version: str, request: EvaluateRequest):

@@ -1,4 +1,5 @@
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,7 +78,19 @@ class MixedModel:
     async def complete(self, messages, tools):
         if any(message["role"] == "tool" for message in messages):
             return {"role": "assistant", "content": "Done."}
-        calls = [tool_call(str(index), tool, args)["tool_calls"][0] for index, (tool, args) in enumerate(self.steps)]
+        calls = []
+        for index, (tool, args) in enumerate(self.steps):
+            if tool == "computer_use":
+                fields = ("url", "direction", "amount") if args["action"] in {"navigate", "scroll"} else (
+                    "x", "y", "end_x", "end_y",
+                )
+                command = ["harness", "computer", args["action"].replace("_", "-"),
+                           *(str(args[field]) for field in fields if field in args)]
+                for option in ("selector", "path", "target", "x", "y"):
+                    if option in args and option not in fields:
+                        command.extend([f"--{option}", str(args[option])])
+                tool, args = "bash", {"command": shlex.join(command)}
+            calls.append(tool_call(str(index), tool, args)["tool_calls"][0])
         return {"role": "assistant", "content": None, "tool_calls": calls}
 
 
@@ -144,6 +157,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
                     approval = run["approval"]
                     tool, args = steps[index]
                     self.assertEqual(approval["tool"], tool)
+                    if tool == "computer_use":
+                        self.assertEqual(approval["entrypoint"], "bash")
+                        self.assertTrue(approval["command"].startswith("harness computer "))
                     self.assertEqual({key: approval["arguments"][key] for key in args}, args)
                     if routed_targets is not None:
                         self.assertEqual(approval["arguments"].get("target"), routed_targets[index])
@@ -175,7 +191,7 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
     async def test_auto_checks_each_cloud_tool_call(self):
         await self.check_approvals([
             ("computer_use", {"action": "observe"}),
-            ("computer_use", {"action": "scroll", "dy": 420}),
+            ("computer_use", {"action": "scroll", "direction": "down", "amount": 420}),
             ("bash", {"command": "printf done"}),
             ("bash", {"command": "printf done > report.txt"}),
             ("computer_use", {"action": "navigate", "url": "https://example.test"}),
@@ -188,7 +204,7 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         steps = [
             ("computer_use", {"action": "screenshot"}),
             ("computer_use", {"action": "observe"}),
-            ("computer_use", {"action": "scroll", "dy": 2}),
+            ("computer_use", {"action": "scroll", "direction": "down", "amount": 2}),
             ("computer_use", {"action": "click", "x": 8, "y": 7}),
             ("bash", {"command": "pwd"}),
             ("bash", {"command": "ls -la ~/Documents/ ~/Desktop/ ~/Pictures/ 2>/dev/null"}),
@@ -255,3 +271,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(mode=mode):
                 await self.check_approvals(steps, pauses, mode=mode, trust_bash=trust_bash, automatic=automatic)
+
+    async def test_trusted_cloud_bash_does_not_authorize_cli_mouse_input(self):
+        await self.check_approvals([
+            ("bash", {"command": "printf done > report.txt"}),
+            ("computer_use", {"action": "click", "x": 8, "y": 7}),
+        ], pauses=(1,), automatic=(0,), trust_bash=True)

@@ -48,6 +48,10 @@ class BrowserGesturesTest(unittest.IsolatedAsyncioTestCase):
             await self.computer("drag", x=10, y=20, end_x=30, end_y=40)
         self.page.mouse.up.assert_awaited_once_with()
 
+    async def test_screen_info_does_not_launch_browser_or_capture_screen(self):
+        self.assertEqual(await self.computer("screen_info"), {"target": "browser", "width": 1280, "height": 720})
+        self.controller._get_page.assert_not_awaited()
+
 
 class DesktopGesturesTest(unittest.TestCase):
     def setUp(self):

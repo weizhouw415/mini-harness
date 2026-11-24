@@ -6,21 +6,14 @@ from harness.core.context import TOOLS, build_messages
 
 
 class ToolContextTest(unittest.TestCase):
-    def test_model_can_use_bash_and_canonical_gui_actions(self):
+    def test_model_sees_only_bash_and_discovers_gui_through_cli(self):
         schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in TOOLS}
-        self.assertEqual(set(schemas), {"bash", "computer_use"})
+        self.assertEqual(set(schemas), {"bash"})
         bash = schemas["bash"]
         self.assertEqual(bash["required"], ["command"])
         self.assertEqual(bash["properties"]["timeout"]["default"], 120)
         self.assertFalse(bash["additionalProperties"])
-
-        computer = schemas["computer_use"]
-        self.assertEqual(computer["required"], ["action"])
-        self.assertFalse(computer["additionalProperties"])
-        fields = computer["properties"]
-        actions = {"double_click", "right_click", "move", "drag", "key", "press"}
-        self.assertTrue(actions.issubset(fields["action"]["enum"]))
-        self.assertEqual(set(fields["direction"]["enum"]), {"up", "down", "left", "right"})
+        self.assertIn("harness computer", TOOLS[0]["function"]["description"])
 
     def test_skill_workspace_is_advertised_only_with_bash_and_support(self):
         skills = Mock()

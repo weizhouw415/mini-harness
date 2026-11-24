@@ -1,6 +1,7 @@
 """Authenticate outbound workers and route a run to a single execution environment."""
 
 import asyncio
+import base64
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -9,15 +10,18 @@ from typing import Any
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .protocol import (
+    ARTIFACT_CHUNK_BYTES,
     HANDSHAKE_TIMEOUT,
     IMAGE_TYPES,
     MAX_IMAGE_BYTES,
+    MAX_ARTIFACT_FILE_BYTES,
     VERSION,
     authentication_proof,
     decode,
     encode,
     is_identifier,
     is_nonce,
+    validate_artifact_response,
     verify_proof,
 )
 
@@ -262,6 +266,8 @@ class WorkerManager:
             response: dict[str, Any] | Exception = WorkerCallError(error)
         elif isinstance(result, dict) and error is None and "image" not in result:
             response = result
+            if "content" in result:
+                validate_artifact_response(result["content"])
             if "image_bytes" in result:
                 size = result.pop("image_bytes")
                 if (
@@ -274,6 +280,17 @@ class WorkerManager:
                 if not isinstance(binary, bytes) or len(binary) != size:
                     raise ValueError("Invalid worker image frame")
                 result["image"] = binary
+            for block in result.get("content", []):
+                if "data_bytes" not in block:
+                    continue
+                size = block.pop("data_bytes")
+                data = bytearray()
+                while len(data) < size:
+                    binary = await _receive(worker.websocket)
+                    if not isinstance(binary, bytes) or len(binary) != min(ARTIFACT_CHUNK_BYTES, size - len(data)):
+                        raise ValueError("Invalid worker artifact frame")
+                    data.extend(binary)
+                block["data"] = bytes(data)
         else:
             raise ValueError("Invalid worker response")
         future = worker.pending.get(call_id)
@@ -397,6 +414,15 @@ class WorkerManager:
             call_id, "computer.execute", {"run_id": run_id, "action": action}, 120
         )
 
+    async def computer_cli(
+        self, worker_id: str, run_id: str, call_id: str, action: dict[str, Any], *,
+        observe: bool, output: str | None, timeout: int = 120,
+    ) -> dict[str, Any]:
+        return await self._get_worker(worker_id, run_id).request(
+            call_id, "computer.cli", {"run_id": run_id, "action": action, "observe": observe, "output": output},
+            timeout,
+        )
+
     async def prepare_skill_workspace(self, worker_id: str, run_id: str, skills: list[dict]) -> None:
         await self._get_worker(worker_id, run_id).request(
             secrets.token_hex(16), "skills.prepare", {"run_id": run_id, "skills": skills}, 15,
@@ -406,6 +432,18 @@ class WorkerManager:
         return await self._get_worker(worker_id, run_id).request(
             secrets.token_hex(16), "skills.collect", {"run_id": run_id}, 15,
         )
+
+    async def stage_artifact(self, worker_id: str, run_id: str, path: str, content: bytes) -> None:
+        if not isinstance(content, bytes) or len(content) > MAX_ARTIFACT_FILE_BYTES:
+            raise WorkerCallError("Upload exceeds the worker file size limit")
+        for offset in range(0, max(len(content), 1), ARTIFACT_CHUNK_BYTES):
+            chunk = content[offset:offset + ARTIFACT_CHUNK_BYTES]
+            await self._get_worker(worker_id, run_id).request(
+                secrets.token_hex(16), "artifacts.stage", {
+                    "run_id": run_id, "path": path, "offset": offset, "total": len(content),
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                }, 15,
+            )
 
     async def release(self, worker_id: str, run_id: str) -> None:
         reservation = self._reservations.get(worker_id)

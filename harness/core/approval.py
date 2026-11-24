@@ -40,10 +40,11 @@ def decide_approval(mode: ApprovalMode, tool: str, args: dict, capabilities: dic
     target = args.get("target", "browser" if cloud else "desktop")
     targets = capabilities.get("computer_targets")
     actions = targets.get(target) if isinstance(targets, dict) else capabilities.get("actions")
-    if capabilities.get("computer") is not True or not isinstance(actions, list) or action not in actions:
+    required_action = "screenshot" if action == "screen_info" else action
+    if capabilities.get("computer") is not True or not isinstance(actions, list) or required_action not in actions:
         return ApprovalDecision(True, "此 Worker 未声明支持该操作的自动审批。")
-    fields = set(args) - {"target"}
-    if action in {"observe", "screenshot"} and fields == {"action"}:
+    fields = set(args) - {"target", "observe", "output"}
+    if action in {"observe", "screenshot", "screen_info"} and fields == {"action"}:
         if target == "browser":
             return ApprovalDecision(False, "仅截图或观察当前浏览器页面。")
         if desktop:

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import socket
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from harness.api.server import create_app
 from harness.config import Settings
@@ -29,6 +31,7 @@ PROVIDER_TOKEN = "csv-acceptance-provider-token-only"
 CSV_TASK = "Sign in to the inventory fixture, double each CSV quantity, and upload the result."
 CSV_FOLLOWUP = "Repeat the CSV inventory upload from the previous run."
 CSV_RESULT = "The processed inventory CSV was uploaded."
+CSV_REASONING = "Verified that the uploaded inventory matches the transformed rows."
 SKILL_GUIDANCE = "Use CSV parsing to double the inventory quantity column before uploading."
 CSV_SKILL = f"""---
 name: csv-inventory
@@ -70,9 +73,66 @@ def csv_calls(fixture_url: str):
     ]
 
 
+def computer_command(*arguments: str):
+    return "bash", {"command": shlex.join(("harness", "computer", *arguments))}
+
+
+def csv_cli_calls(fixture_url: str):
+    return [
+        computer_command("navigate", fixture_url),
+        computer_command("screenshot", "--output", "browser-screen.png"),
+        computer_command("type", "fixture-user", "--selector", "#username"),
+        computer_command("type", "fixture-password", "--selector", "#password"),
+        computer_command("click", "--selector", "#login", "--observe"),
+        computer_command("download", "--selector", "#download", "--path", "source.csv"),
+        ("bash", {"command": PROCESS_INVENTORY, "timeout": 10}),
+        computer_command("upload", "--selector", "#upload", "--path", "processed.csv"),
+        computer_command("click", "--selector", "#submit"),
+    ]
+
+
+def streamed_completion(message: dict, *, usage: dict | None = None,
+                        continue_after_reasoning: asyncio.Event | None = None):
+    def event(delta: dict, *, finish_reason: str | None = None):
+        chunk = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    async def chunks():
+        yield ": provider ready\n\n"
+        yield event({"role": "assistant"})
+        reasoning = message.get("reasoning_content")
+        if reasoning:
+            middle = len(reasoning) // 2
+            yield event({"reasoning_content": reasoning[:middle]})
+            if continue_after_reasoning is not None:
+                await asyncio.wait_for(continue_after_reasoning.wait(), timeout=20)
+            yield event({"reasoning_content": reasoning[middle:]})
+        if content := message.get("content"):
+            middle = len(content) // 2
+            yield event({"content": content[:middle]})
+            yield event({"content": content[middle:]})
+        calls = message.get("tool_calls", [])
+        for index, call in enumerate(calls):
+            function = call["function"]
+            middle = len(function["arguments"]) // 2
+            yield event({"tool_calls": [{
+                "index": index, "id": call["id"], "type": call["type"],
+                "function": {"name": function["name"], "arguments": function["arguments"][:middle]},
+            }]})
+        for index in reversed(range(len(calls))):
+            arguments = calls[index]["function"]["arguments"]
+            yield event({"tool_calls": [{"index": index, "function": {"arguments": arguments[len(arguments) // 2:]}}]})
+        yield event({}, finish_reason="tool_calls" if calls else "stop")
+        if usage is not None:
+            yield f"data: {json.dumps({'choices': [], 'usage': usage})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(chunks(), media_type="text/event-stream")
+
+
 class ScriptedModel:
     def __init__(self, fixture_url: str):
-        calls = csv_calls(fixture_url)
+        calls = csv_cli_calls(fixture_url)
         self.calls = {
             CSV_TASK: calls,
             CSV_FOLLOWUP: [
@@ -94,7 +154,7 @@ class ScriptedModel:
             return {"role": "assistant", "content": CSV_SKILL}
 
         exposed_tools = {tool["function"]["name"] for tool in tools}
-        if exposed_tools != {"bash", "computer_use"}:
+        if exposed_tools != {"bash"}:
             raise AssertionError(f"Unexpected model tools: {exposed_tools}")
 
         task = next(message["content"] for message in reversed(messages)
@@ -120,7 +180,7 @@ class ScriptedModel:
             self.saw_reusable_skill = result.get("exit_code") == 0 and SKILL_GUIDANCE in result.get("stdout", "")
         calls = self.calls[task]
         if index == len(calls):
-            return {"role": "assistant", "content": CSV_RESULT}
+            return {"role": "assistant", "content": CSV_RESULT, "reasoning_content": CSV_REASONING}
 
         name, arguments = calls[index]
         self.next_call[task] += 1
@@ -235,8 +295,9 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.headers.get("Authorization"), f"Bearer {PROVIDER_TOKEN}")
                 payload = await request.json()
                 self.assertEqual(payload["model"], PROVIDER_MODEL)
+                self.assertIs(payload["stream"], True)
                 message = await model.complete(payload["messages"], payload.get("tools", []))
-                return {"choices": [{"message": message}], "usage": {"total_tokens": 1}}
+                return streamed_completion(message, usage={"total_tokens": 1})
 
             backend = WorkerBackend(workspace_root=data_dir / "worker", executable_path=executable)
 
@@ -254,12 +315,30 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 event_types = [event["type"] for event in events]
                 self.assertEqual(event_types.count("tool_call"), len(model.calls[CSV_TASK]))
                 self.assertEqual(event_types.count("tool_result"), len(model.calls[CSV_TASK]))
+                deltas = [event["data"] for event in events if event["type"] == "assistant_delta"]
+                self.assertEqual("".join(delta.get("content", "") for delta in deltas), CSV_RESULT)
+                self.assertEqual("".join(delta.get("reasoning_content", "") for delta in deltas), CSV_REASONING)
+                final = [event["data"] for event in events if event["type"] == "assistant"][-1]
+                self.assertEqual(final["message"]["content"], CSV_RESULT)
+                self.assertEqual(final["message"]["reasoning_content"], CSV_REASONING)
+                self.assertEqual(final["usage"], {"total_tokens": 1})
+                self.assertEqual({delta["generation_id"] for delta in deltas}, {final["generation_id"]})
                 self.assertEqual(first_run["worker_id"], WORKER_ID)
+                cli_events = [event["data"] for event in events
+                              if event["type"] == "tool_call" and event["data"].get("entrypoint") == "bash"]
+                self.assertEqual([event["command"] for event in cli_events], [
+                    arguments["command"] for _, arguments in model.calls[CSV_TASK]
+                    if arguments["command"].startswith("harness computer ")
+                ])
+                self.assertTrue(all(event["tool"] == "computer_use" for event in cli_events))
 
-                screenshot = next(
-                    event["data"]["result"]["artifact"] for event in events
+                captures = [
+                    event["data"]["result"] for event in events
                     if event["type"] == "tool_result" and "artifact" in event["data"]["result"]
-                )
+                ]
+                self.assertEqual(len(captures), 2)
+                self.assertEqual(captures[0]["path"], "browser-screen.png")
+                screenshot = captures[0]["artifact"]
                 artifact = (await client.get(f"/v1/runs/{first_run['id']}/artifacts/{screenshot}")).raise_for_status()
                 self.assertTrue(artifact.content.startswith(b"\x89PNG\r\n\x1a\n"))
 
@@ -347,10 +426,10 @@ class RecoveryModel:
     async def complete(self, messages, tools):
         observations = [json.loads(message["content"]) for message in messages if message["role"] == "tool"]
         if not observations:
-            return tool_call("first", "computer_use", {"action": "click", "x": 0, "y": 0})
+            return tool_call("first", *computer_command("click", "0", "0"))
         if len(observations) == 1:
             self.saw_unknown_outcome = observations[0].get("outcome_unknown") is True
-            return tool_call("inspect", "computer_use", {"action": "observe"})
+            return tool_call("inspect", *computer_command("screenshot"))
         return {"role": "assistant", "content": "Inspected worker state after the interruption."}
 
 
@@ -394,6 +473,6 @@ class WorkerRecoveryTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(completed["status"], "completed", completed)
                 self.assertEqual(completed["worker_id"], WORKER_ID)
                 self.assertEqual(backend.opens, [(original["id"], original["workspace_id"])])
-                self.assertEqual(backend.actions, ["click", "observe"])
+                self.assertEqual(backend.actions, ["click", "screenshot"])
                 self.assertTrue(model.saw_unknown_outcome)
 

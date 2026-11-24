@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.core.approval_shell import is_safe_bash
+from workers.common.artifacts import add_artifact_content, artifact_requests, stage_upload
 from workers.common.browser import BROWSER_ACTIONS, BrowserController, BrowserSession
+from workers.common.computer_cli import run_computer_cli
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
 from workers.common.skill_workspace import collect_skill_candidates, prepare_skill_workspace
@@ -36,8 +38,8 @@ class WorkerBackend:
     def capabilities(self) -> dict:
         return {
             "environment": "cloud-browser", "desktop": False, "bash": True,
-            "safe_bash_path": True, "skill_workspace": True,
-            "computer": True, "download": True, "upload": True, "actions": list(BROWSER_ACTIONS),
+            "safe_bash_path": True, "skill_workspace": True, "artifact_workspace": True,
+            "computer": True, "computer_cli": True, "download": True, "upload": True, "actions": list(BROWSER_ACTIONS),
             "computer_targets": {"browser": list(BROWSER_ACTIONS)},
         }
 
@@ -72,22 +74,32 @@ class WorkerBackend:
                 raise ValueError("Run has no available skill workspace")
             return collect_skill_candidates(run.path)
 
+    async def stage_artifact(self, run_id: str, path: str, offset: int, total: int, data: bytes) -> None:
+        run = self._get_run(run_id)
+        async with run.lock:
+            if run.closed:
+                raise ValueError("Run is closed")
+            stage_upload(run.path, path, offset, total, data)
+
     async def bash(self, run_id: str, command: str, timeout: float) -> dict:
         run = self._get_run(run_id)
         async with run.lock:
             if run.closed:
                 raise ValueError("Run is closed")
             safe = is_safe_bash(command)
+            arguments = ["/bin/bash", "--noprofile", "--norc"]
+            environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(run.path),
+                           "TMPDIR": str(run.path), "LANG": "C.UTF-8"}
             if safe:
-                command = "PATH=/usr/bin:/bin\n" + command
-            return await run_shell(
-                ["/bin/bash", "--noprofile", "--norc", *(["-p"] if safe else []), "-c", command],
-                cwd=run.path, timeout=timeout,
-                environment={
-                    "PATH": "/usr/local/bin:/usr/bin:/bin",
-                    "HOME": str(run.path), "TMPDIR": str(run.path), "LANG": "C.UTF-8",
-                },
-            )
+                return await run_shell(
+                    [*arguments, "-p", "-c", "PATH=/usr/bin:/bin\n" + command],
+                    cwd=run.path, timeout=timeout, environment=environment,
+                )
+            with artifact_requests(run.path) as (setup, channel):
+                result = await run_shell(
+                    [*arguments, "-c", setup + command], cwd=run.path, timeout=timeout, environment=environment,
+                )
+                return await add_artifact_content(result, run.path, channel)
 
     async def computer(self, run_id: str, action: dict) -> dict:
         run = self._get_run(run_id)
@@ -95,6 +107,17 @@ class WorkerBackend:
             if run.closed:
                 raise ValueError("Run is closed")
             return await self._browser.computer(run.browser_session, run.path, action)
+
+    async def computer_cli(self, run_id: str, action: dict, *, observe: bool, output: str | None) -> dict:
+        run = self._get_run(run_id)
+        async with run.lock:
+            if run.closed:
+                raise ValueError("Run is closed")
+
+            async def execute(command):
+                return await self._browser.computer(run.browser_session, run.path, command)
+
+            return await run_computer_cli(run.path, action, execute, observe=observe, output=output)
 
     async def close_run(self, run_id: str) -> None:
         run = self._runs.get(run_id)

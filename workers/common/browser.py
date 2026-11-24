@@ -106,8 +106,10 @@ class BrowserController:
         if action.get("target", "browser") != "browser":
             raise ValueError("This browser only accepts browser computer actions")
         name = text_field(action, "action", limit=40)
-        if name not in BROWSER_ACTIONS:
+        if name not in BROWSER_ACTIONS and name != "screen_info":
             raise ValueError(f"Unsupported browser action: {name}")
+        if name == "screen_info":
+            return {"target": "browser", **VIEWPORT}
         page = await self._get_page(session)
         if name in {"screenshot", "observe"}:
             return {

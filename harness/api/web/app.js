@@ -9,7 +9,7 @@ const active = new Set(["queued", "running", "awaiting_approval", "paused"]);
 const progressLabels = {
   submitting: ["正在发送", "正在创建任务"],
   queued: ["等待运行", "正在调度任务"],
-  running: ["正在运行", "运行有进展时会自动更新"],
+  running: ["等待模型响应", "任务仍在运行"],
   awaiting_approval: ["等待审批", "此任务需要你确认下一步操作"],
   paused: ["已暂停", "可以恢复运行或取消任务"],
 };
@@ -29,6 +29,11 @@ const approvalHints = {
   auto: "低风险操作自动通过，其他操作需确认",
   allow: "所有工具调用都直接执行",
 };
+const attachmentLimits = { count: 8, file: 20 * 1024 ** 2, total: 40 * 1024 ** 2 };
+const fileSizeFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
+const imageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"]);
+const fileSourceNames = { output: "输出文件", preview: "运行预览" };
+const textPreviewLimit = 256 * 1024;
 sessionStorage.removeItem("harness-token");
 let modelConfig = null;
 let selected = "";
@@ -41,6 +46,8 @@ let scrollToLatest = false;
 let conversationLoading = false;
 const turns = new Map();
 const drafts = new Map();
+let draftFiles = [];
+let filePreview = null;
 let revision = 0;
 let polling = false;
 let submitting = null;
@@ -72,12 +79,14 @@ function notice(message = "", source = "") {
   $("notice").dataset.source = source;
 }
 
-async function request(path, { method = "GET", body } = {}) {
-  const headers = { "X-Harness-UI": "1" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+async function request(path, { method = "GET", body, extraHeaders, timeout = 12000 } = {}) {
+  const headers = { "X-Harness-UI": "1", ...extraHeaders };
+  if (body !== undefined && !(body instanceof Blob)) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(body);
+  }
   const response = await fetch(path, {
-    method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-    cache: "no-store", signal: AbortSignal.timeout(12000),
+    method, headers, body, cache: "no-store", signal: AbortSignal.timeout(timeout),
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -143,6 +152,11 @@ function draftKey() {
   return selected ? "session/" + selected : legacyRun;
 }
 
+function saveDraft(key, task, files) {
+  if (task || files.length) drafts.set(key, { task, files });
+  else drafts.delete(key);
+}
+
 function pendingSubmission() {
   return submitting?.version === revision ? submitting : null;
 }
@@ -166,7 +180,7 @@ function setText(node, content) {
 function updateSendControl() {
   const pending = Boolean(pendingSubmission());
   const button = $("send");
-  button.disabled = !$("task").value.trim() || !chosenWorker() || Boolean(submitting) ||
+  button.disabled = !($("task").value.trim() || draftFiles.length) || !chosenWorker() || Boolean(submitting) ||
     Boolean((selected || legacyRun) && !run) || active.has(run?.status) || Boolean(pendingAction());
   button.setAttribute("aria-busy", String(pending));
   button.setAttribute("aria-label", pending ? "正在发送" : "发送消息");
@@ -204,7 +218,9 @@ function showRunControls() {
   const reason = approval?.reason || "";
   setText($("approval-reason"), reason);
   $("approval-reason").hidden = !reason;
-  setText($("approval-detail"), args ? JSON.stringify(args, null, 2) : "");
+  const argumentsText = args ? JSON.stringify(args, null, 2) : "";
+  const command = approval?.entrypoint === "bash" ? approval.command : "";
+  setText($("approval-detail"), command ? "CLI 命令\n" + command + "\n\n执行参数\n" + argumentsText : argumentsText);
   $("approval-mode").disabled = conversationLoading;
   $("approval-mode").setAttribute("aria-busy", String(changingApprovalMode));
   for (const button of actionButtons) {
@@ -225,13 +241,15 @@ function sidebar(open) {
 
 function select(hash, initial = null) {
   const sessionId = hash.startsWith("session/") ? hash.slice("session/".length) : "";
-  const oldDraft = $("task").value;
-  if (oldDraft) drafts.set(draftKey(), oldDraft);
-  else drafts.delete(draftKey());
+  saveDraft(draftKey(), $("task").value, draftFiles);
   revision++;
   selected = idPattern.test(sessionId) ? sessionId : "";
   legacyRun = idPattern.test(hash) ? hash : "";
-  $("task").value = drafts.get(draftKey()) || "";
+  const draft = drafts.get(draftKey());
+  $("task").value = draft?.task || "";
+  draftFiles = draft?.files || [];
+  attachmentError();
+  showDraftFiles();
   resizeComposer();
   const nextHash = selected ? "#session/" + selected : legacyRun ? "#" + legacyRun : location.pathname;
   history.replaceState(null, "", nextHash);
@@ -240,6 +258,7 @@ function select(hash, initial = null) {
   }
   for (const url of urls) URL.revokeObjectURL(url);
   urls.clear();
+  if ($("file-dialog").open) $("file-dialog").close();
   visibleHistoryTurns.disconnect();
   turns.clear();
   $("turns").replaceChildren();
@@ -325,6 +344,145 @@ async function showScreenshot(container, name, id) {
   }
 }
 
+function fileSize(size) {
+  if (size >= 1024 ** 2) return fileSizeFormat.format(size / 1024 ** 2) + " MB";
+  if (size >= 1024) return fileSizeFormat.format(size / 1024) + " KB";
+  return fileSizeFormat.format(size) + " B";
+}
+
+function fileSummary(file) {
+  const label = Object.hasOwn(fileSourceNames, file.source) ? fileSourceNames[file.source] : "";
+  return [label, fileSize(file.size)].filter(Boolean).join(" · ");
+}
+
+function filePreviewType(file) {
+  const type = (file.mime_type || file.type || "").split(";")[0].trim().toLowerCase();
+  if (imageTypes.has(type)) return type;
+  if (type.startsWith("text/") || /(?:[+/](?:json|xml)|application\/x-yaml)$/.test(type)) return "text";
+  if ((!type || type === "application/octet-stream") &&
+      /\.(?:txt|md|markdown|csv|tsv|log|json|jsonl|xml|yaml|yml|toml|ini|sql)$/i.test(file.name)) return "text";
+  return "";
+}
+
+async function fileData({ file, runId, localFile }, limit) {
+  if (localFile) return limit ? localFile.slice(0, limit) : localFile;
+  const path = "/v1/runs/" + encodeURIComponent(runId) + "/files/" + encodeURIComponent(file.id);
+  const extraHeaders = limit ? { Range: "bytes=0-" + (limit - 1) } : undefined;
+  const response = await request(path, { extraHeaders, timeout: 60000 });
+  const data = await response.blob();
+  return limit ? data.slice(0, limit) : data;
+}
+
+function clearFilePreview() {
+  if (filePreview?.url) URL.revokeObjectURL(filePreview.url);
+  filePreview = null;
+  $("file-preview").replaceChildren();
+}
+
+async function showFile(file, runId, localFile) {
+  clearFilePreview();
+  const preview = { file, runId, localFile };
+  filePreview = preview;
+  const type = filePreviewType(file);
+  const content = $("file-preview");
+  const dialog = $("file-dialog");
+  setText($("file-dialog-title"), file.name);
+  setText($("file-dialog-meta"), fileSummary(file));
+  $("file-download-error").hidden = true;
+  $("download-file").disabled = false;
+  content.append(element("p", type ? "正在读取预览…" : "此文件可下载后查看。", "file-preview-note"));
+  if (!dialog.open) dialog.showModal();
+  if (!type) return;
+  try {
+    const limit = type === "text" && file.size > textPreviewLimit ? textPreviewLimit : undefined;
+    const data = await fileData(preview, limit);
+    if (filePreview !== preview) return;
+    if (type === "text") {
+      const text = await data.text();
+      if (filePreview !== preview) return;
+      const body = text ? element("pre", text, "file-preview-text") : element("p", "文件为空。", "file-preview-note");
+      content.replaceChildren(body);
+      if (limit) content.append(element("p", "仅显示前 256 KB，可下载查看完整文件。", "file-preview-note"));
+      return;
+    }
+    const image = element("img", undefined, "file-preview-image");
+    image.alt = file.name;
+    preview.url = URL.createObjectURL(data.slice(0, data.size, type));
+    image.src = preview.url;
+    await image.decode();
+    if (filePreview === preview) content.replaceChildren(image);
+  } catch {
+    if (filePreview === preview) content.replaceChildren(element("p", "无法读取预览，可下载文件。", "file-preview-note"));
+  }
+}
+
+function fileCard(file, runId, localFile, remove) {
+  const item = element("li", undefined, "file-card");
+  const button = element("button", undefined, "file-open");
+  button.type = "button";
+  button.title = file.name;
+  const copy = element("span", undefined, "file-copy");
+  copy.append(element("span", file.name, "file-name"), element("span", fileSummary(file), "file-meta"));
+  button.append(traceIcon("file"), copy);
+  button.addEventListener("click", () => void showFile(file, runId, localFile));
+  item.append(button);
+  if (remove) {
+    const dismiss = element("button", undefined, "file-remove");
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "移除 " + file.name);
+    dismiss.append(traceIcon("close"));
+    dismiss.addEventListener("click", remove);
+    item.append(dismiss);
+  }
+  return item;
+}
+
+function attachmentError(message = "") {
+  const error = $("attachment-error");
+  setText(error, message);
+  error.hidden = !message;
+}
+
+function showDraftFiles() {
+  const container = $("attachment-draft");
+  container.hidden = !draftFiles.length;
+  $("attach").disabled = submitting?.origin === draftKey();
+  container.replaceChildren(...draftFiles.map((entry, index) => fileCard(entry.file, null, entry.file, () => {
+    if (submitting?.origin === draftKey()) return;
+    preserveScroll(() => {
+      draftFiles = draftFiles.filter((candidate) => candidate !== entry);
+      attachmentError();
+      showDraftFiles();
+    });
+    updateSendControl();
+    (container.children[Math.min(index, draftFiles.length - 1)]?.querySelector(".file-remove") || $("attach")).focus();
+  })));
+}
+
+function promptMessage(task) {
+  const node = element("div", undefined, "turn-prompt");
+  if (task) node.append(element("div", task, "task"));
+  const files = element("ul", undefined, "file-list turn-uploads");
+  files.setAttribute("aria-label", "上传附件");
+  files.hidden = true;
+  node.append(files);
+  return { node, files };
+}
+
+function renderTurnFiles(view, value) {
+  const files = value.files;
+  if (!Array.isArray(files)) return;
+  const key = JSON.stringify(files);
+  if (view.filesKey === key) return;
+  view.filesKey = key;
+  const uploads = files.filter((file) => file.source === "upload");
+  const outputs = files.filter((file) => Object.hasOwn(fileSourceNames, file.source));
+  view.uploads.hidden = !uploads.length;
+  view.outputs.hidden = !outputs.length;
+  view.uploads.replaceChildren(...uploads.map((file) => fileCard(file, value.id)));
+  view.outputFiles.replaceChildren(...outputs.map((file) => fileCard(file, value.id)));
+}
+
 function assistantMessage(text) {
   const message = element("div", undefined, "message");
   renderMarkdown(message, text);
@@ -337,9 +495,11 @@ const traceIcons = {
   screen: "M4 4h16a1 1 0 0 1 1 1v11H3V5a1 1 0 0 1 1-1ZM3 16v1a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-1M8 21h8m-4-3v3",
   terminal: "m5 7 5 5-5 5m8 0h6",
   message: "M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.8-3.6A7.5 7.5 0 1 1 20 11.5Z",
+  file: "M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10ZM13 3v7h7m-11 5h6m-6 3h6",
+  close: "m6 6 12 12M18 6 6 18",
 };
 const traceActions = {
-  screenshot: "截取屏幕", observe: "观察屏幕", navigate: "打开网页", click: "点击",
+  screenshot: "截取屏幕", screen_info: "查看屏幕信息", observe: "观察屏幕", navigate: "打开网页", click: "点击",
   double_click: "双击", right_click: "右键点击", move: "移动指针", drag: "拖动",
   type: "输入文字", scroll: "滚动页面", key: "按键", press: "按键", download: "下载文件", upload: "上传文件",
 };
@@ -430,17 +590,20 @@ function createTraceStep(view, data, event, id) {
   const approval = element("p", undefined, "trace-note");
   approval.hidden = true;
   const fields = element("dl", undefined, "trace-fields");
+  const command = element("div");
+  command.hidden = true;
+  command.append(element("dt", "CLI 命令"), element("dd"));
   const args = element("div");
   args.hidden = true;
   args.append(element("dt", "执行参数"), element("dd"));
   const result = element("div");
   result.hidden = true;
   result.append(element("dt", "工具结果"), element("dd"));
-  fields.append(args, result);
+  fields.append(command, args, result);
   const screenshot = element("div");
   detail.append(traceTimeLabel(event.created_at), approval, fields, screenshot);
   details.append(summary, detail);
-  const step = { details, tool: data.tool, title, caption, state, approval, fields: { args, result }, screenshot };
+  const step = { details, tool: data.tool, title, caption, state, approval, fields: { command, args, result }, screenshot };
   summary.addEventListener("click", () => { view.tracePreference = true; });
   details.addEventListener("toggle", () => loadTraceScreenshot(view, step, id));
   view.timeline.append(details);
@@ -456,6 +619,10 @@ function recordTraceCall(view, event, id) {
   const { type, data } = event;
   const step = view.calls.get(data.call_id) || createTraceStep(view, data, event, id);
   view.calls.set(data.call_id, step);
+  if (step.fields.command.hidden && data.entrypoint === "bash" && typeof data.command === "string") {
+    step.fields.command.lastElementChild.append(element("pre", data.command));
+    step.fields.command.hidden = false;
+  }
   if (step.args === undefined && data.arguments !== undefined) {
     step.args = data.arguments;
     showTraceField(step.fields.args, step.args);
@@ -495,20 +662,17 @@ function recordTraceCall(view, event, id) {
   refreshTraceStep(step, view.traceStatus);
 }
 
-function addTraceEntry(view, icon, title, caption, time, message) {
+function addTraceEntry(view, icon, title, caption, time) {
   const entry = element("div", undefined, "trace-entry");
   const symbol = element("span", undefined, "trace-step-symbol");
   symbol.append(traceIcon(icon));
   const content = element("div", undefined, "trace-step-text");
-  content.append(element("span", title, "trace-step-title"));
+  const label = element("span", title, "trace-step-title");
+  content.append(label);
   if (caption) content.append(element("span", caption, "trace-step-caption"));
   entry.append(symbol, content, traceTimeLabel(time));
-  if (message) {
-    const body = element("div", undefined, "trace-entry-body");
-    body.append(assistantMessage(message));
-    entry.append(body);
-  }
   view.timeline.append(entry);
+  return { entry, label };
 }
 
 function showRawEvents(view) {
@@ -525,32 +689,142 @@ function showRawEvents(view) {
   view.logRendered = view.eventLog.length;
 }
 
-function appendReasoning(view, content) {
-  if (typeof content !== "string" || !content.trim()) return;
-  const segment = element("div", undefined, "reasoning-segment");
-  renderMarkdown(segment, content);
-  view.reasoningBody.append(segment);
-  view.reasoningPreview.textContent = content.trim();
-  view.reasoning.hidden = false;
+function createReasoning(view, generation) {
+  const entry = element("details", undefined, "trace-reasoning");
+  const summary = element("summary", undefined, "trace-step-summary");
+  const symbol = element("span", undefined, "trace-step-symbol");
+  symbol.append(traceIcon("activity"));
+  const label = element("span", undefined, "trace-step-text");
+  const title = element("span", "思考过程", "trace-step-title");
+  const preview = element("span", undefined, "trace-step-caption");
+  label.append(title, preview);
+  const timestamp = traceTimeLabel(generation.time);
+  summary.append(symbol, label, timestamp, traceIcon("chevron"));
+  const body = element("div", undefined, "trace-step-detail trace-reasoning-body");
+  const text = element("div", undefined, "trace-reasoning-text");
+  body.append(text);
+  entry.append(summary, body);
+  view.timeline.insertBefore(entry, generation.update?.entry || null);
+  const reasoning = { entry, title, preview, body, text };
+  summary.addEventListener("click", () => { reasoning.preference = !entry.open; });
+  entry.addEventListener("toggle", updateJump);
+  return reasoning;
+}
+
+function assistantGeneration(view, event) {
+  const id = event.data.generation_id;
+  if (!view.generation || view.generation.id !== id) {
+    view.generation?.reasoningRow?.entry.remove();
+    view.generation?.update?.entry.remove();
+    view.generation = { id, time: event.created_at, reasoning: "", content: "" };
+  }
+  return view.generation;
+}
+
+function paintGeneration(view, generation, settled = false) {
+  const running = view.traceStatus === "running" && !generation.interrupted;
+  const thinking = !settled && running && !generation.content.trim();
+  if (generation.reasoning.trim()) {
+    const row = generation.reasoningRow ||= createReasoning(view, generation);
+    setText(row.title, thinking ? "正在思考" : "思考过程");
+    const preview = generation.reasoning.trim().replace(/\s+/g, " ");
+    setText(row.preview, thinking ? preview.slice(-160) : preview.slice(0, 160));
+    row.entry.dataset.live = String(thinking);
+    if (row.preference === undefined) row.entry.open = thinking;
+    const atBottom = row.body.scrollHeight - row.body.scrollTop - row.body.clientHeight < 24;
+    if (settled) renderMarkdown(row.text, generation.reasoning);
+    else setText(row.text, generation.reasoning);
+    if (thinking && atBottom) row.body.scrollTop = row.body.scrollHeight;
+  }
+  if (!settled && view.traceStatus === "completed") {
+    generation.update?.entry.remove();
+    generation.update = undefined;
+  } else if (generation.content.trim()) {
+    if (!generation.update) {
+      const update = addTraceEntry(view, "message", "助手更新", "", generation.time);
+      update.entry.classList.add("trace-update");
+      const body = element("div", undefined, "trace-entry-body");
+      update.message = element("div", undefined, "message");
+      body.append(update.message);
+      update.entry.append(body);
+      generation.update = update;
+    }
+    const update = generation.update;
+    const live = !settled && running;
+    setText(update.label, live ? "助手正在更新" : settled ? "助手更新" : "部分回复");
+    update.entry.dataset.live = String(live);
+    if (settled) renderMarkdown(update.message, generation.content);
+    else setText(update.message, generation.content);
+  }
+}
+
+function paintRunProgress(view) {
+  if (view.traceStatus !== "running") return;
+  const progress = view.answer.firstElementChild;
+  if (!progress?.classList.contains("turn-progress")) return;
+  let [title, description] = progressLabels.running;
+  const generation = view.generation;
+  if (view.phase === "generating" && generation && !generation.interrupted) {
+    if (generation.content.trim()) title = "正在生成内容";
+    else if (generation.reasoning.trim()) title = "正在思考";
+  } else if (view.phase === "tool") {
+    title = "正在执行工具";
+    description = view.activeStep?.title.textContent || description;
+  } else if (view.phase === "preparing") {
+    title = "正在准备工具操作";
+  } else if (view.phase === "tool-result") {
+    description = "工具已返回，等待模型继续";
+  } else if (view.phase === "finishing") {
+    title = "正在整理结果";
+  } else if (!view.phase && !view.traceLoaded) {
+    title = "任务运行中";
+  }
+  setText(progress.querySelector(".activity-title"), title);
+  setText(progress.querySelector(".activity-description"), description);
 }
 
 function appendEvents(view, events, id) {
   for (const event of events) {
+    if (event.seq <= view.after) continue;
     const { data, type } = event;
     view.after = event.seq;
     view.eventLog.push(event);
-    if (type === "assistant") {
-      appendReasoning(view, data.message?.reasoning_content);
+    if (type === "assistant_delta") {
+      const generation = assistantGeneration(view, event);
+      if (typeof data.content === "string") generation.content += data.content;
+      if (typeof data.reasoning_content === "string") generation.reasoning += data.reasoning_content;
+      view.phase = "generating";
+    } else if (type === "assistant") {
+      const generation = assistantGeneration(view, event);
+      generation.reasoning = data.message?.reasoning_content ?? generation.reasoning;
+      generation.content = data.message?.content ?? "";
       for (const call of data.calls || []) view.plannedCalls.set(call.call_id, call.arguments);
-      if (data.message?.content && data.calls?.length) {
-        addTraceEntry(view, "message", "助手更新", "", event.created_at, data.message.content);
+      if (!data.calls?.length && view.traceStatus === "completed") {
+        generation.update?.entry.remove();
+        generation.content = "";
       }
+      paintGeneration(view, generation, true);
+      view.generation = null;
+      view.phase = data.calls?.length ? "preparing" : "finishing";
+      if (!data.calls?.length) view.finalUpdate = generation.update?.entry;
     } else if (type === "worker_bound") {
       addTraceEntry(view, "screen", "已连接 Worker", data.worker_id, event.created_at);
     } else if (data.call_id && traceCallEvents.has(type)) {
       recordTraceCall(view, event, id);
+      if (type === "tool_call") {
+        view.phase = "tool";
+        view.activeStep = view.calls.get(data.call_id);
+      } else if (type === "tool_result") {
+        view.phase = "tool-result";
+        view.activeStep = null;
+      }
+    } else if (type === "status" && data.status === "paused" && view.generation) {
+      view.generation.interrupted = true;
+      view.phase = null;
     }
   }
+  if (view.generation) paintGeneration(view, view.generation);
+  paintRunProgress(view);
   const count = view.calls.size;
   view.traceCount.textContent = count ? count + " 次工具操作" : "";
   view.traceCount.hidden = !count;
@@ -614,19 +888,6 @@ function createTurn(value) {
   const node = element("article", undefined, "turn");
   node.dataset.runId = value.id;
 
-  const reasoning = element("details", undefined, "reasoning");
-  reasoning.hidden = true;
-  const reasoningSummary = element("summary", undefined, "reasoning-summary");
-  const reasoningSymbol = element("span", undefined, "reasoning-symbol");
-  reasoningSymbol.append(traceIcon("message"));
-  const reasoningPreview = element("span", undefined, "reasoning-preview");
-  reasoningPreview.setAttribute("aria-hidden", "true");
-  reasoningSummary.append(reasoningSymbol, element("span", "思考过程", "reasoning-title"),
-    reasoningPreview, traceIcon("chevron"));
-  const reasoningBody = element("div", undefined, "reasoning-body");
-  reasoning.append(reasoningSummary, reasoningBody);
-  reasoning.addEventListener("toggle", updateJump);
-
   const trace = element("details", undefined, "trace");
   const summary = element("summary", undefined, "trace-summary");
   const symbol = element("span", undefined, "trace-symbol");
@@ -634,7 +895,7 @@ function createTurn(value) {
   const traceCount = element("span", undefined, "trace-count");
   traceCount.hidden = true;
   const traceStatusLabel = element("span", undefined, "trace-status");
-  summary.append(symbol, element("span", "运行轨迹", "trace-title"), traceCount, traceStatusLabel, traceIcon("chevron"));
+  summary.append(symbol, element("span", "运行过程", "trace-title"), traceCount, traceStatusLabel, traceIcon("chevron"));
 
   const body = element("div", undefined, "trace-body");
   const timeline = element("div", undefined, "trace-timeline");
@@ -652,12 +913,17 @@ function createTurn(value) {
   trace.append(summary, body);
 
   const answer = element("div", undefined, "turn-answer");
+  const outputs = element("section", undefined, "turn-outputs");
+  outputs.hidden = true;
+  const outputFiles = element("ul", undefined, "file-list");
+  outputs.append(element("h3", "运行产物"), outputFiles);
   const response = element("div", undefined, "turn-response");
-  response.append(reasoning, trace, answer);
-  node.append(element("div", value.task, "task"), response);
+  response.append(trace, answer, outputs);
+  const prompt = promptMessage(value.task);
+  node.append(prompt.node, response);
   const view = {
     node, trace, timeline, tracePending, traceError, traceCount, traceStatusLabel, answer,
-    reasoning, reasoningBody, reasoningPreview,
+    uploads: prompt.files, outputs, outputFiles,
     raw, rawCount, rawEntries, after: 0, eventLog: [], logRendered: 0, calls: new Map(), plannedCalls: new Map(),
   };
   summary.addEventListener("click", () => {
@@ -681,6 +947,7 @@ function turnProgress(state, error) {
   const [title, description] = progressLabels[state];
   const card = element("div", undefined, "turn-progress");
   card.dataset.state = state;
+  card.setAttribute("role", "status");
   const indicator = element("span", undefined, "activity-indicator");
   indicator.setAttribute("aria-hidden", "true");
   indicator.append(element("span"), element("span"), element("span"));
@@ -691,11 +958,14 @@ function turnProgress(state, error) {
   return card;
 }
 
-function pendingTurn(task) {
+function pendingTurn(task, attachments) {
   const node = element("article", undefined, "turn");
   const answer = element("div", undefined, "turn-answer");
-  answer.append(turnProgress("submitting"));
-  node.append(element("div", task, "task"), answer);
+  const prompt = promptMessage(task);
+  prompt.files.hidden = !attachments.length;
+  prompt.files.append(...attachments.map(({ file }) => fileCard(file, null, file)));
+  answer.append(turnProgress("submitting", attachments.length ? "正在上传附件…" : undefined));
+  node.append(prompt.node, answer);
   return node;
 }
 
@@ -725,6 +995,7 @@ function paintTurn(value, index) {
   }
 
   updateTrace(view, value);
+  renderTurnFiles(view, value);
   const hasApproval = Boolean(value.approval);
   if (view.output !== value.output || view.error !== value.error || view.status !== value.status ||
       view.hasApproval !== hasApproval) {
@@ -734,6 +1005,9 @@ function paintTurn(value, index) {
     view.error = value.error;
     view.status = value.status;
     view.hasApproval = hasApproval;
+    if (value.status === "completed") view.finalUpdate?.remove();
+    if (view.generation) paintGeneration(view, view.generation);
+    paintRunProgress(view);
     if (view.trace.open || active.has(value.status)) void loadTrace(view, value.id);
   }
 }
@@ -909,11 +1183,13 @@ $("composer").addEventListener("submit", async (event) => {
   const input = $("task");
   const draft = input.value;
   const task = draft.trim();
-  if (!task || $("send").disabled) return;
+  const attachments = draftFiles;
+  if ($("send").disabled) return;
   const draftVersion = revision;
   if (!modelConfig?.configured) {
     await openSettings(true);
-    if (!modelConfig?.configured || draftVersion !== revision || input.value !== draft || $("send").disabled) return;
+    if (!modelConfig?.configured || draftVersion !== revision || input.value !== draft ||
+        draftFiles !== attachments || $("send").disabled) return;
   }
   const version = ++revision;
   const origin = draftKey();
@@ -921,16 +1197,32 @@ $("composer").addEventListener("submit", async (event) => {
     task, worker_id: chosenWorker(), session_id: selected || null,
     approval_mode: $("approval-mode").value,
   };
-  const placeholder = pendingTurn(task);
-  const submission = { version, approvalMode: body.approval_mode };
+  const placeholder = pendingTurn(task, attachments);
+  const submission = { version, origin, approvalMode: body.approval_mode };
   submitting = submission;
   input.value = "";
+  draftFiles = [];
+  attachmentError();
+  showDraftFiles();
   resizeComposer();
   $("turns").append(placeholder);
   showRunControls();
   notice();
   scrollToEnd();
   try {
+    body.upload_ids = [];
+    for (const entry of attachments) {
+      if (!entry.upload) {
+        entry.upload = await api("/v1/uploads", {
+          method: "POST", body: entry.file, timeout: 120000,
+          extraHeaders: {
+            "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(entry.file.name),
+          },
+        }).catch((error) => { throw new Error(entry.file.name + " 上传失败。" + error.message); });
+      }
+      body.upload_ids.push(entry.upload.id);
+    }
+    if (attachments.length) setText(placeholder.querySelector(".activity-description"), "正在创建任务");
     const value = await api("/v1/runs", { method: "POST", body });
     if (version === revision) {
       submitting = null;
@@ -950,13 +1242,18 @@ $("composer").addEventListener("submit", async (event) => {
       void updateApprovalMode(value.id, submission.approvalMode);
     }
   } catch (error) {
-    if (origin === draftKey() && !input.value) input.value = draft;
-    else if (origin !== draftKey() && !drafts.has(origin)) drafts.set(origin, draft);
+    if (origin === draftKey()) {
+      if (!input.value) input.value = draft;
+      draftFiles = attachments;
+    } else {
+      saveDraft(origin, drafts.get(origin)?.task || draft, attachments);
+    }
     if (version === revision) notice(error.message);
   } finally {
     submitting = null;
     preserveScroll(() => {
       placeholder.remove();
+      showDraftFiles();
       resizeComposer();
       showRunControls();
     });
@@ -1007,7 +1304,7 @@ function closeSidebar() {
 }
 $("sidebar-scrim").addEventListener("click", closeSidebar);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !$("model-dialog").open && $("sidebar").classList.contains("open")) {
+  if (event.key === "Escape" && !$("model-dialog").open && !$("file-dialog").open && $("sidebar").classList.contains("open")) {
     closeSidebar();
   }
 });
@@ -1033,10 +1330,61 @@ $("worker").addEventListener("change", () => {
   workerTouched = true;
   updateSendControl();
 });
+$("attach").addEventListener("click", () => $("attachment-input").click());
+$("attachment-input").addEventListener("change", (event) => {
+  const input = event.target;
+  const picked = Array.from(input.files);
+  input.value = "";
+  if (!picked.length || submitting?.origin === draftKey()) return;
+  const next = [...draftFiles, ...picked.map((file) => ({ file }))];
+  const tooLarge = picked.find((file) => file.size > attachmentLimits.file);
+  let error = "";
+  if (tooLarge) error = tooLarge.name + " 超过单个附件 20 MB 的限制。";
+  else if (next.length > attachmentLimits.count) error = "每条消息最多可添加 8 个附件。";
+  else if (next.reduce((size, { file }) => size + file.size, 0) > attachmentLimits.total) {
+    error = "每条消息的附件合计不能超过 40 MB。";
+  }
+  preserveScroll(() => {
+    attachmentError(error);
+    if (!error) {
+      draftFiles = next;
+      showDraftFiles();
+    }
+  });
+  updateSendControl();
+});
+$("close-file").addEventListener("click", () => $("file-dialog").close());
+$("file-dialog").addEventListener("close", () => {
+  if (!$("file-dialog").open) clearFilePreview();
+});
+$("download-file").addEventListener("click", async (event) => {
+  const preview = filePreview;
+  if (!preview) return;
+  const button = event.currentTarget;
+  button.disabled = true;
+  $("file-download-error").hidden = true;
+  try {
+    const data = await fileData(preview);
+    if (filePreview !== preview) return;
+    const url = URL.createObjectURL(data.slice(0, data.size, "application/octet-stream"));
+    const link = element("a");
+    link.href = url;
+    link.download = preview.file.name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    if (filePreview === preview) {
+      setText($("file-download-error"), "下载失败。" + error.message);
+      $("file-download-error").hidden = false;
+    }
+  } finally {
+    if (filePreview === preview) button.disabled = false;
+  }
+});
 $("task").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
-  if (!event.repeat && !$("send").disabled && $("task").value.trim()) $("composer").requestSubmit($("send"));
+  if (!event.repeat && !$("send").disabled) $("composer").requestSubmit($("send"));
 });
 $("task").addEventListener("input", () => {
   preserveScroll(resizeComposer);
@@ -1049,3 +1397,8 @@ window.addEventListener("hashchange", () => select(location.hash.slice(1)));
 select(location.hash.slice(1));
 void openSettings(true);
 setInterval(refresh, 1600);
+setInterval(() => {
+  if (run?.status !== "running" || document.hidden) return;
+  const view = turns.get(run.id);
+  if (view) void loadTrace(view, run.id);
+}, 350);

@@ -14,6 +14,8 @@ from pathlib import Path
 from harness.core.approval_shell import is_safe_bash
 from harness.execution.protocol import MAX_IMAGE_BYTES
 from workers.common.actions import GUI_ACTIONS, point_fields, scroll_deltas, text_field
+from workers.common.artifacts import add_artifact_content, artifact_requests, stage_upload
+from workers.common.computer_cli import run_computer_cli
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
 from workers.common.skill_workspace import collect_skill_candidates, prepare_skill_workspace
@@ -62,7 +64,9 @@ class WorkerBackend:
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
             "safe_bash_path": True, "skill_workspace": self.bash_enabled and self.desktop_enabled,
-            "computer": self.desktop_enabled, "download": False, "upload": False,
+            "artifact_workspace": self.desktop_enabled,
+            "computer": self.desktop_enabled, "computer_cli": self.desktop_enabled,
+            "download": False, "upload": False,
             "actions": actions, "computer_targets": {"desktop": actions},
         }
 
@@ -117,6 +121,14 @@ class WorkerBackend:
             if run.closed or not run.skill_workspace_prepared:
                 raise ValueError("Run has no available skill workspace")
             return collect_skill_candidates(run.path)
+
+    async def stage_artifact(self, run_id: str, path: str, offset: int, total: int, data: bytes) -> None:
+        run = self._get_run(run_id)
+        async with run.lock:
+            self.check_available()
+            if run.closed:
+                raise ValueError("Run is closed")
+            stage_upload(run.path, path, offset, total, data)
 
     def _get_gui(self):
         if self._gui is None:
@@ -254,6 +266,9 @@ class WorkerBackend:
             gui = self._get_gui()
             try:
                 gui.failSafeCheck()
+                if name == "screen_info":
+                    width, height = gui.size()
+                    return {"target": "desktop", "width": width, "height": height}
                 if name in {"screenshot", "observe"}:
                     return self._screenshot(gui)
                 if name in CLICK_METHODS:
@@ -280,22 +295,33 @@ class WorkerBackend:
                 raise PermissionError("Desktop worker paused by the mouse-corner fail-safe") from exc
             return {"ok": True}
 
-    async def computer(self, run_id: str, action: dict) -> dict:
+    async def _execute_computer(self, run: Run, action: dict) -> dict:
         if action.get("target", "desktop") != "desktop":
             raise ValueError("This worker only accepts desktop computer actions")
         name = text_field(action, "action", limit=40)
-        if name not in ACTIONS:
+        if name not in ACTIONS and name != "screen_info":
             raise ValueError(f"Unsupported desktop action: {name}")
+        task = asyncio.create_task(asyncio.to_thread(self._computer, run, name, action))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            run.closed = True
+            with contextlib.suppress(Exception):
+                await task
+            raise
+
+    async def computer(self, run_id: str, action: dict) -> dict:
         run = self._get_run(run_id)
         async with run.lock:
-            task = asyncio.create_task(asyncio.to_thread(self._computer, run, name, action))
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                run.closed = True
-                with contextlib.suppress(Exception):
-                    await task
-                raise
+            return await self._execute_computer(run, action)
+
+    async def computer_cli(self, run_id: str, action: dict, *, observe: bool, output: str | None) -> dict:
+        run = self._get_run(run_id)
+        async with run.lock:
+            async def execute(command):
+                return await self._execute_computer(run, command)
+
+            return await run_computer_cli(run.path, action, execute, observe=observe, output=output)
 
     async def _bash_arguments(self, path: Path, command: str) -> list[str]:
         configured_path = os.getenv("MINI_DESKTOP_BASH_PATH")
@@ -350,22 +376,27 @@ class WorkerBackend:
             self.check_available()
             if run.closed:
                 raise ValueError("Run is closed")
-            arguments = await self._bash_arguments(run.path, command)
-            self.check_available()
-            shell = asyncio.create_task(run_shell(
-                arguments, cwd=run.path, environment=self._bash_environment(), timeout=timeout,
-            ))
-            pause = asyncio.create_task(self._watch_pause())
-            try:
-                completed, _ = await asyncio.wait({shell, pause}, return_when=asyncio.FIRST_COMPLETED)
-                if pause in completed:
-                    raise PermissionError("Desktop worker was paused while Bash was running")
-                return shell.result()
-            finally:
-                for task in (shell, pause):
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(shell, pause, return_exceptions=True)
+            context = (contextlib.nullcontext(("", None)) if is_safe_bash(command)
+                       else artifact_requests(run.path))
+            with context as (setup, channel):
+                arguments = await self._bash_arguments(run.path, setup + command)
+                self.check_available()
+                shell = asyncio.create_task(run_shell(
+                    arguments, cwd=run.path, environment=self._bash_environment(), timeout=timeout,
+                ))
+                pause = asyncio.create_task(self._watch_pause())
+                try:
+                    completed, _ = await asyncio.wait({shell, pause}, return_when=asyncio.FIRST_COMPLETED)
+                    if pause in completed:
+                        raise PermissionError("Desktop worker was paused while Bash was running")
+                    result = await add_artifact_content(shell.result(), run.path, channel)
+                    self.check_available()
+                    return result
+                finally:
+                    for task in (shell, pause):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(shell, pause, return_exceptions=True)
 
     async def close_run(self, run_id: str) -> None:
         run = self._runs.get(run_id)

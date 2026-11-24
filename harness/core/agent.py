@@ -7,17 +7,24 @@ import sqlite3
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from harness.artifacts.files import MAX_PREVIEWS
+from harness.artifacts.preview import preview
 from harness.config import Settings
-from harness.core.approval import decide_approval
+from harness.core.approval import ApprovalDecision, decide_approval
 from harness.core.context import DEFAULT_BASH_TIMEOUT, TOOLS, build_messages
 from harness.core.llm import LLM, ModelError
+from harness.core.multimodal import artifact_block, persist_content
+from harness.execution.computer_cli import COMPUTER_HELP, parse_computer_command
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
 from harness.skills.loader import SkillError
 from harness.storage.sqlite import RunStore
-from workers.common.actions import point_fields, scroll_deltas, text_field
+from workers.common.actions import GUI_ACTIONS, SCROLL_DIRECTIONS, point_fields, scroll_deltas, text_field
 
 logger = logging.getLogger(__name__)
-COMPUTER_ACTIONS = {name for name in TOOLS[1]["function"]["parameters"]["properties"]["action"]["enum"]}
+COMPUTER_ACTIONS = {*GUI_ACTIONS, "observe", "navigate", "press", "download", "upload", "screen_info"}
+COMPUTER_TEXT_FIELDS = {"action", "target", "direction", "url", "selector", "text", "key", "path"}
+COMPUTER_INTEGER_FIELDS = {"x", "y", "end_x", "end_y", "amount", "dx", "dy"}
+ASSISTANT_DELTA_INTERVAL = 0.15
 
 
 class Agent:
@@ -88,9 +95,10 @@ class Agent:
         run_id = run["id"]
         directory = self.store.directory / "artifacts" / run_id
         previous = self.store.previous(run["session_id"], run_id)
+        await self._prepare_uploads(run, capabilities)
         capabilities = await self._prepare_skill_workspace(run, capabilities)
         while True:
-            events = self.store.events(run_id)
+            events = self.store.events(run_id, include_deltas=False)
             turns = [event["data"] for event in events if event["type"] == "assistant"]
             if turns:
                 latest = turns[-1]
@@ -101,19 +109,92 @@ class Agent:
                     return
                 if not await self._deliver(run, capabilities, latest["calls"], events):
                     return
-                events = self.store.events(run_id)
+                events = self.store.events(run_id, include_deltas=False)
             if len(turns) >= self.settings.max_steps:
                 raise ModelError("Maximum number of model steps reached.")
             messages = build_messages(run, capabilities, self.skills, previous, events, directory,
-                                      self.settings.context_chars)
+                                      self.settings.context_chars,
+                                      file_path=lambda identifier: self.store.run_file(run_id, identifier)[1])
+            await self._complete_turn(run_id, messages)
+
+    async def _complete_turn(self, run_id: str, messages: list[dict]):
+        stream_complete = getattr(self.llm, "stream_complete", None)
+        generation = {}
+        if stream_complete is None:
             reply = await self.llm.complete(messages, TOOLS)
-            message, calls = self._normalize(reply)
-            self.store.event(run_id, "assistant", {"message": message, "calls": calls, "usage": reply.get("_usage")})
+        else:
+            generation = {"generation_id": uuid4().hex}
+            loop = asyncio.get_running_loop()
+            buffered: dict[str, list[str]] = {}
+            last_flush = float("-inf")
+            scheduled: asyncio.TimerHandle | None = None
+
+            def flush():
+                nonlocal last_flush, scheduled
+                scheduled = None
+                if buffered:
+                    delta = {key: "".join(parts) for key, parts in buffered.items()}
+                    self.store.event(run_id, "assistant_delta", {**generation, **delta})
+                    buffered.clear()
+                    last_flush = loop.time()
+
+            def on_delta(delta: dict[str, str]):
+                nonlocal scheduled
+                for key, text in delta.items():
+                    buffered.setdefault(key, []).append(text)
+                if scheduled is None:
+                    delay = last_flush + ASSISTANT_DELTA_INTERVAL - loop.time()
+                    if delay <= 0:
+                        flush()
+                    else:
+                        scheduled = loop.call_later(delay, flush)
+
+            try:
+                reply = await stream_complete(messages, TOOLS, on_delta=on_delta)
+            finally:
+                if scheduled is not None:
+                    scheduled.cancel()
+                flush()
+        message, calls = self._normalize(reply)
+        self.store.event(run_id, "assistant", {**generation, "message": message, "calls": calls,
+                                               "usage": reply.get("_usage")})
+
+    async def _prepare_uploads(self, run: dict, capabilities: dict):
+        run_id = run["id"]
+        uploads = [file for file in self.store.files(run_id) if file["source"] == "upload"]
+        if not uploads or any(event["type"] == "uploads_ready"
+                              for event in self.store.events(run_id, include_deltas=False)):
+            return
+        if capabilities.get("artifact_workspace") is not True:
+            raise WorkerCallError("This Worker cannot accept attachments. Update the Worker and retry in a new run.")
+        content = []
+        remaining_images = MAX_PREVIEWS
+        remaining_text = min(24_000, self.settings.context_chars // 2)
+        for upload in uploads:
+            path = self.store.run_file(run_id, upload["id"])[1]
+            await self.workers.stage_artifact(run["worker_id"], run_id, upload["path"],
+                                              await asyncio.to_thread(path.read_bytes))
+            content.append(artifact_block(upload, "artifact"))
+            try:
+                blocks = await asyncio.to_thread(preview, path, filename=upload["name"], automatic=True,
+                                                 max_images=min(3, remaining_images))
+            except (OSError, ValueError):
+                blocks = [{"type": "text", "text": "Automatic preview is unavailable. The file is staged."}]
+            previews = persist_content(self.store, run_id, blocks, preview_prefix=f"previews/{upload['id']}")
+            for block in previews:
+                if block["type"] == "image":
+                    remaining_images -= 1
+                    content.append(block)
+                elif remaining_text:
+                    text = block["text"][:remaining_text]
+                    remaining_text -= len(text)
+                    content.append({"type": "text", "text": text})
+        self.store.event(run_id, "uploads_ready", {"content": content})
 
     async def _prepare_skill_workspace(self, run: dict, capabilities: dict) -> dict:
         if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
             return capabilities
-        events = self.store.events(run["id"])
+        events = self.store.events(run["id"], include_deltas=False)
         if any(event["type"] == "skill_workspace_ready" for event in events):
             return capabilities
         # Only populate the workspace before the model can write to it.
@@ -175,7 +256,10 @@ class Agent:
             tool_calls.append({"id": provider_id, "type": "function", "function": {
                 "name": name, "arguments": arguments,
             }})
-            calls.append({"call_id": uuid4().hex, "provider_id": provider_id, "name": name, "arguments": arguments})
+            call = {"call_id": uuid4().hex, "provider_id": provider_id, "name": name, "arguments": arguments}
+            if name != "bash":
+                call["unsupported"] = True
+            calls.append(call)
         if calls:
             message["tool_calls"] = tool_calls
         elif not text:
@@ -185,7 +269,7 @@ class Agent:
     async def _deliver(self, run: dict, capabilities: dict, calls: list[dict], events: list[dict]) -> bool:
         run_id, worker_id = run["id"], run["worker_id"]
         outcomes = {event["data"]["call_id"] for event in events if event["type"] == "tool_result"}
-        started = {event["data"]["call_id"] for event in events if event["type"] == "tool_call"}
+        started = {event["data"]["call_id"]: event["data"] for event in events if event["type"] == "tool_call"}
         approvals = {event["data"]["call_id"]: event["data"]["approved"]
                      for event in events if event["type"] == "approval_decision"}
         requests = {event["data"]["call_id"]: event["data"]
@@ -195,26 +279,26 @@ class Agent:
             if call_id in outcomes:
                 continue
             if call_id in started:
-                self._result(run_id, call, self._unknown())
+                self._result(run_id, call, self._unknown(), tool=started[call_id]["tool"])
                 continue
             previous_request = requests.get(call_id)
             try:
-                args = self._arguments(call, previous_request)
-                if call["name"] == "computer_use":
-                    args = self._route_computer(args, capabilities)
+                event = self._dispatch_event(call, previous_request, capabilities)
             except ValueError as error:
                 self._result(run_id, call, {"error": str(error)})
                 continue
+            tool, args = event["tool"], event["arguments"]
             if approvals.get(call_id) is False:
-                self._result(run_id, call, {"error": "The operator declined this action."})
+                self._result(run_id, call, {"error": "The operator declined this action."}, tool=tool)
                 continue
-            event = {"call_id": call_id, "tool": call["name"], "arguments": args}
             if call_id not in approvals:
                 approval_mode = self.store.get(run_id)["approval_mode"]
                 decision = decide_approval(
-                    approval_mode, call["name"], args, capabilities,
+                    approval_mode, tool, args, capabilities,
                     trust_cloud_bash=self.settings.trust_cloud_bash,
                 )
+                if event.get("help") and approval_mode != "manual":
+                    decision = ApprovalDecision(False, "仅查看内置命令帮助。")
                 if decision.needs_operator:
                     if decision.reason:
                         event["reason"] = decision.reason
@@ -229,17 +313,60 @@ class Agent:
 
             self.store.event(run_id, "tool_call", event)
             try:
-                if call["name"] == "bash":
+                if event.get("help"):
+                    result = {"exit_code": 0, "stdout": COMPUTER_HELP, "stderr": ""}
+                elif tool == "bash":
                     result = await self.workers.bash(worker_id, run_id, call_id, args["command"], args["timeout"])
+                elif event.get("entrypoint") == "bash":
+                    result = await self._computer_cli(worker_id, run_id, event, capabilities)
                 else:
                     result = await self.workers.computer(worker_id, run_id, call_id, args)
             except WorkerDisconnected:
-                self._result(run_id, call, self._unknown())
+                self._result(run_id, call, self._unknown(), tool=tool)
                 raise
             except WorkerCallError as error:
                 result = {"error": str(error)}
-            self._result(run_id, call, result)
+            self._result(run_id, call, result, tool=tool)
         return True
+
+    def _dispatch_event(self, call: dict, previous_request: dict | None, capabilities: dict) -> dict:
+        if call.get("unsupported"):
+            raise ValueError("Unknown tool. Use bash, or run harness computer --help for graphical operations.")
+        if previous_request:
+            # Resume with the exact target, arguments, and timeout shown for approval.
+            return {key: value for key, value in previous_request.items() if key != "reason"}
+        args = self._arguments(call)
+        event = {"call_id": call["call_id"], "tool": call["name"], "arguments": args}
+        if call["name"] == "computer_use":
+            # Compatible with native computer calls persisted before the CLI was introduced.
+            event["arguments"] = self._route_computer(args, capabilities)
+            return event
+        command = parse_computer_command(args["command"])
+        if command is None:
+            return event
+        if command.action is None:
+            return {**event, "help": True}
+        action = self._route_computer(self._validate_computer(command.action), capabilities)
+        if command.observe:
+            action["observe"] = True
+        if command.output is not None:
+            action["output"] = command.output
+        return {**event, "tool": "computer_use", "entrypoint": "bash", "arguments": action,
+                "command": args["command"], "timeout": args["timeout"]}
+
+    async def _computer_cli(self, worker_id: str, run_id: str, event: dict, capabilities: dict) -> dict:
+        action = dict(event["arguments"])
+        observe, output = action.pop("observe", False), action.pop("output", None)
+        if capabilities.get("computer_cli") is True:
+            result = await self.workers.computer_cli(worker_id, run_id, event["call_id"], action,
+                                                     observe=observe, output=output, timeout=event["timeout"])
+        else:
+            if observe or output is not None or action["action"] == "screen_info":
+                raise WorkerCallError("This command option requires a Worker with the updated Computer CLI.")
+            result = await self.workers.computer(worker_id, run_id, event["call_id"], action)
+        output_fields = {key: value for key, value in result.items() if key not in {"image", "content", "error"}}
+        return {"exit_code": int(bool(result.get("error"))), "stdout": json.dumps(output_fields, ensure_ascii=False),
+                "stderr": result.get("error", ""), **result}
 
     def _arguments(self, call: dict, previous_request: dict | None = None) -> dict:
         try:
@@ -259,17 +386,22 @@ class Agent:
             return {"command": command, "timeout": timeout}
         if call["name"] != "computer_use":
             raise ValueError("Unknown tool.")
-        schema = TOOLS[1]["function"]["parameters"]["properties"]
+        return self._validate_computer(args)
+
+    @staticmethod
+    def _validate_computer(args: dict) -> dict:
         if not isinstance(args.get("action"), str) or args["action"] not in COMPUTER_ACTIONS:
             raise ValueError("Unknown computer action.")
         for key, value in args.items():
-            field = schema.get(key, {})
-            allowed = field.get("type")
-            if allowed == "string" and type(value) is str and ("enum" not in field or value in field["enum"]):
+            if key in COMPUTER_TEXT_FIELDS and type(value) is str:
                 continue
-            if allowed == "integer" and type(value) is int:
+            if key in COMPUTER_INTEGER_FIELDS and type(value) is int:
                 continue
             raise ValueError(f"Invalid computer action argument: {key}.")
+        if "target" in args and args["target"] not in {"browser", "desktop"}:
+            raise ValueError("Computer target must be browser or desktop.")
+        if "direction" in args and args["direction"] not in SCROLL_DIRECTIONS:
+            raise ValueError("Scroll direction must be up, down, left, or right.")
         action = args["action"]
         if action == "navigate":
             url = urlsplit(args.get("url", ""))
@@ -302,6 +434,8 @@ class Agent:
         native_target = "browser" if capabilities.get("environment") == "cloud-browser" else "desktop"
         targets = capabilities.get("computer_targets")
         target = args.get("target", native_target)
+        if capabilities.get("computer") is False:
+            raise ValueError(f"Computer operations are unavailable on target {target}.")
         if target == "desktop" and args["action"] in {"click", "double_click", "right_click"}:
             point_fields(args)
         if not isinstance(targets, dict):
@@ -312,7 +446,8 @@ class Agent:
         actions = targets.get(target)
         if not isinstance(actions, list):
             raise ValueError(f"This worker does not support computer target: {target}.")
-        if args["action"] not in actions:
+        supported_action = "screenshot" if args["action"] == "screen_info" else args["action"]
+        if supported_action not in actions:
             raise ValueError(f"Computer action {args['action']} is unavailable on target {target}.")
         return {**args, "target": target}
 
@@ -321,8 +456,10 @@ class Agent:
         return {"error": "The action outcome is unknown after interruption. Inspect the worker state before retrying.",
                 "outcome_unknown": True}
 
-    def _result(self, run_id: str, call: dict, result: dict):
+    def _result(self, run_id: str, call: dict, result: dict, *, tool: str | None = None):
         result = dict(result)
+        blocks = result.pop("content", None)
+        content = (persist_content(self.store, run_id, blocks) if isinstance(blocks, list) else [])
         image = result.pop("image", None)
         mime = result.pop("mime_type", "image/png")
         if image is not None:
@@ -331,8 +468,11 @@ class Agent:
                 result["error"] = "Invalid or oversized worker screenshot."
             else:
                 name = call["call_id"] + extension
-                path = self.store.image_path(run_id, name)
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                path.write_bytes(image)
+                file = self.store.add_run_file(run_id, "preview", f"screenshots/{name}", image,
+                                               mime_type=mime, legacy_name=name)
+                content.append(artifact_block(file, "image"))
                 result.update({"artifact": name, "mime_type": mime})
-        self.store.event(run_id, "tool_result", {"call_id": call["call_id"], "tool": call["name"], "result": result})
+        if content:
+            result["content"] = content
+        self.store.event(run_id, "tool_result", {"call_id": call["call_id"], "tool": tool or call["name"],
+                                                 "result": result})
