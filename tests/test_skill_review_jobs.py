@@ -10,7 +10,7 @@ from harness.skills.jobs import SkillReviewJobs
 
 
 class ReviewJobsTest(unittest.IsolatedAsyncioTestCase):
-    async def test_queue_persists_and_proposal_does_not_overwrite(self):
+    async def test_review_updates_skill_and_stores_only_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = RunStore(root)
@@ -23,16 +23,20 @@ class ReviewJobsTest(unittest.IsolatedAsyncioTestCase):
             existing = skills / 'existing'
             existing.mkdir()
             document = existing / 'SKILL.md'
-            document.write_text('original')
+            original = '---\nname: existing\ndescription: Existing workflow\n---\n\nOriginal instructions.\n'
+            updated = '---\nname: existing\ndescription: Existing workflow\n---\n\nImproved instructions.\n'
+            document.write_text(original)
             jobs = SkillReviewJobs(store, SimpleNamespace(complete=AsyncMock()), skills)
-            proposal = {'status': 'proposed', 'action': 'update', 'name': 'existing', 'content': 'candidate'}
+            proposal = {'status': 'proposed', 'action': 'update', 'name': 'existing',
+                        'content': updated, 'base_content': original}
             with patch('harness.skills.jobs.review_skills', new=AsyncMock(return_value=proposal)):
                 await jobs._process(*jobs._claim())
-            self.assertEqual(document.read_text(), 'original')
+            self.assertEqual(document.read_text(), updated)
             with store.connect() as db:
                 result = json.loads(db.execute('SELECT result FROM skill_review_jobs').fetchone()[0])
-            self.assertEqual(result['content'], 'candidate')
-            self.assertEqual(store.events(run['id'])[-1]['data']['status'], 'proposed')
+            self.assertNotIn('content', result)
+            self.assertNotIn('base_content', result)
+            self.assertEqual(store.events(run['id'])[-1]['data']['status'], 'completed')
 
     async def test_completed_review_creates_skill(self):
         with tempfile.TemporaryDirectory() as tmp:

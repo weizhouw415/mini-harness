@@ -416,15 +416,25 @@ class WorkerManager:
             {"run_id": run_id, "workspace_id": workspace_id},
             60,
         )
+        self._set_metadata(worker, metadata)
+
+    @staticmethod
+    def _set_metadata(worker: WorkerConnection, metadata: dict) -> None:
         profiles = metadata.get("skill_profiles")
         worker.skill_profiles = [
             {key: profile[key] for key in ("name", "description", "path")}
-            for profile in profiles[:32]
+            for profile in profiles[:512]
             if isinstance(profile, dict) and all(isinstance(profile.get(key), str) and len(profile[key]) <= 4096
                                                  for key in ("name", "description", "path"))
         ] if isinstance(profiles, list) else []
         directory = metadata.get("skill_directory")
         worker.skill_directory = directory if isinstance(directory, str) and len(directory) <= 4096 else ""
+
+    async def refresh_run_metadata(self, worker_id: str, run_id: str) -> WorkerConnection:
+        worker = self._get_worker(worker_id, run_id)
+        metadata = await worker.request(secrets.token_hex(16), "run.metadata", {"run_id": run_id}, 60)
+        self._set_metadata(worker, metadata)
+        return worker
 
     @staticmethod
     def _validate_run(run_id: str, workspace_id: str) -> None:

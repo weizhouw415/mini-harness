@@ -16,6 +16,15 @@ from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOAD_BYTES, MAX_UPLOAD
 
 ApprovalMode = Literal["legacy", "manual", "auto", "allow"]
 
+# Corrections in a subsequent turn are useful review signals even when the
+# conversation did not need many tool-calling iterations.
+_CORRECTION = re.compile(
+    r"(?:不对|有误|错了|不应该|不要再|别再|改成|改为|应该是|而不是|纠正|"
+    r"\b(?:incorrect|that's wrong|instead|actually|please stop|don't do that)\b)",
+    re.IGNORECASE,
+)
+_SKILL_REVIEW_INTERVAL = 10
+
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
@@ -319,9 +328,10 @@ class RunStore:
     def transition(self, run_id: str, source: set[str], status: str, *, worker_id: str | None = None,
                    error: str | None = None, output: str | None = None, approval: dict | None = None,
                    event: tuple[str, dict] | None = None, memory_extract: bool = False,
-                   skill_review: bool = False):
+                   skill_review: bool | Literal["auto"] = False):
         conditions = ", ".join("?" for _ in source)
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             changed = db.execute(
                 f"""UPDATE runs SET status = ?, worker_id = COALESCE(?, worker_id), error = ?,
                     output = ?, approval = ?, updated_at = ? WHERE id = ? AND status IN ({conditions})""",
@@ -333,12 +343,40 @@ class RunStore:
             if event:
                 self._append(db, run_id, *event)
             self._append(db, run_id, "status", {"status": status, "error": error})
-            if skill_review and status == "completed":
-                db.execute("INSERT OR IGNORE INTO skill_review_jobs(run_id, created_at) VALUES (?, ?)", (run_id, now()))
-                self._append(db, run_id, "skill_review", {"status": "queued"})
+            if status == "completed" and skill_review:
+                due = skill_review is True or self._skill_review_due(db, run_id)
+                if due:
+                    queued = db.execute("INSERT OR IGNORE INTO skill_review_jobs(run_id, created_at) VALUES (?, ?)",
+                                        (run_id, now()))
+                    if queued.rowcount:
+                        self._append(db, run_id, "skill_review", {"status": "queued"})
             if memory_extract and status == "completed":
                 from harness.memory.jobs import MemoryJobs
                 MemoryJobs.enqueue_extract(db, run_id)
+
+    @staticmethod
+    def _skill_review_due(db: sqlite3.Connection, run_id: str) -> bool:
+        run = db.execute("SELECT session_id, task FROM runs WHERE id = ?", (run_id,)).fetchone()
+        session_id = run["session_id"]
+        previous = db.execute(
+            "SELECT 1 FROM runs WHERE session_id = ? AND id != ? AND status = 'completed' LIMIT 1",
+            (session_id, run_id),
+        ).fetchone()
+        if previous and _CORRECTION.search(run["task"]):
+            return True
+        last_review = db.execute(
+            """SELECT COALESCE(MAX(e.seq), 0) FROM events e JOIN runs r ON r.id = e.run_id
+               WHERE r.session_id = ? AND e.type = 'skill_review'
+               AND json_extract(e.data, '$.status') = 'queued'""",
+            (session_id,),
+        ).fetchone()[0]
+        iterations = db.execute(
+            """SELECT COUNT(*) FROM events e JOIN runs r ON r.id = e.run_id
+               WHERE r.session_id = ? AND r.status = 'completed' AND e.seq > ?
+               AND e.type = 'assistant' AND json_array_length(e.data, '$.calls') > 0""",
+            (session_id, last_review),
+        ).fetchone()[0]
+        return iterations >= _SKILL_REVIEW_INTERVAL
 
     def update_approval_mode(self, run_id: str, mode: ApprovalMode) -> tuple[dict, bool]:
         requeued = False

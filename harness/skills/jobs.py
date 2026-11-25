@@ -7,7 +7,9 @@ from uuid import uuid4
 
 from harness.skills.evolution import review_skills
 from harness.skills.profiles import skill_profiles
-from harness.skills.publication import publish_new_skill, SkillPublicationConflict
+from harness.skills.publication import (
+    SkillPublicationConflict, preflight_skill, publish_new_skill, publish_skill_file, publish_skill_update,
+)
 from harness.storage.sqlite import now
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,14 @@ class SkillReviewJobs:
                     profile['content'] = document.read(32000)
             except (OSError, UnicodeError):
                 pass
-        trace = {**run, 'events': events}
+        previous = self.store.previous(run['session_id'], run_id)
+        previous = [item for item in previous if item['status'] == 'completed']
+        for index in range(len(previous) - 1, -1, -1):
+            if any(event['type'] == 'skill_review' and event['data'].get('status') == 'queued'
+                   for event in previous[index]['events']):
+                previous = previous[index + 1:]
+                break
+        trace = {**run, 'events': events, 'previous': previous[-20:]}
         result = await asyncio.wait_for(review_skills(trace, profiles, self.llm.complete, environment=environment), timeout=180)
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -61,14 +70,20 @@ class SkillReviewJobs:
             if not current:
                 return
             if result.get('status') == 'proposed':
-                if result.get('action') == 'create':
-                    try:
+                try:
+                    preflight_skill(self.directory, result['name'], result['action'], result['content'],
+                                    result.get('base_content'), result.get('files', {}))
+                    if result.get('action') == 'create':
                         publish_new_skill(self.directory, result['name'], result['content'])
-                        result = {'status': 'completed', 'name': result['name'], 'action': 'create'}
-                    except SkillPublicationConflict:
-                        result = {'status': 'proposed', 'name': result['name'], 'reason': '同名技能已存在，未覆盖。', 'content': result['content']}
-                else:
-                    result['reason'] = '已有技能的修改已保留为候选，尚未覆盖原文件。'
+                    for path, change in result.get('files', {}).items():
+                        publish_skill_file(self.directory, result['name'], path, change['content'], change.get('base_content'))
+                    if result.get('action') == 'update':
+                        publish_skill_update(self.directory, result['name'], result['content'], result.get('base_content'))
+                    result = {'status': 'completed', 'name': result['name'], 'action': result['action']}
+                except SkillPublicationConflict:
+                    result = {'status': 'failed', 'name': result['name'], 'reason': '技能文件在复盘期间发生变化，请重新复盘。'}
+            # Review output stored with the run is metadata only. Skill content lives on disk.
+            result = {key: value for key, value in result.items() if key not in {'content', 'base_content', 'files'}}
             db.execute("UPDATE skill_review_jobs SET status='done', result=?, lease_until=NULL WHERE run_id=?", (json.dumps(result, ensure_ascii=False), run_id))
             self.store._append(db, run_id, 'skill_review', {k: v for k, v in result.items() if k != 'content'})
 

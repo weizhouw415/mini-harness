@@ -112,6 +112,8 @@ class _Runtime:
                 return {}
             if self.active_run is None or self.active_run["run_id"] != run_id:
                 raise ValueError("Run is not active on this worker")
+            if method == "run.metadata":
+                return await self._run_metadata()
             if method == "run.close":
                 await self.backend.close_run(run_id)
                 self.active_run = None

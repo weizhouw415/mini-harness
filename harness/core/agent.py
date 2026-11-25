@@ -123,7 +123,7 @@ class Agent:
                     self.store.transition(run_id, {"running"}, "completed", output=output,
                                           memory_extract=bool(self.memory_config and self.memory_config.values["enabled"]
                                                               and self.memory_config.values["automatic"]),
-                                          skill_review=sum(1 for event in events if event["type"] == "tool_call") >= 8)
+                                          skill_review="auto")
                     return
                 if not await self._deliver(run, capabilities, latest["calls"], events, enabled):
                     return
@@ -157,6 +157,11 @@ class Agent:
                         break
                     memories.append({"id": item["id"], "memory_key": item["memory_key"],
                                      "content": item["content"][:remaining]})
+            refresh = getattr(self.workers, "refresh_run_metadata", None)
+            if refresh:
+                worker = await refresh(run["worker_id"], run_id)
+                skill_profiles = worker.skill_profiles
+                skill_directory = worker.skill_directory
             messages = build_messages(run, capabilities, skill_profiles, previous, events, directory,
                                       self.settings.context_chars,
                                       file_path=lambda identifier: self.store.run_file(run_id, identifier)[1],

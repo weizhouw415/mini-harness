@@ -124,6 +124,11 @@ def build_messages(run: dict, capabilities: dict, skill_profiles, previous: list
     visible_capabilities.pop("skill_workspace", None)
     system.append("Worker capabilities: " + json.dumps(visible_capabilities, ensure_ascii=False))
     profiles = [profile for profile in skill_profiles if permitted(profile)]
+    terms = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", run.get("task", "").lower()))
+    profiles.sort(key=lambda profile: -sum(
+        term in (profile.get("name", "") + " " + profile.get("description", "")).lower()
+        for term in terms
+    ))
     while profiles and len(json.dumps(profiles, ensure_ascii=False)) > budget // 8:
         profiles.pop()
     if skill_directory and permitted(skill_directory):

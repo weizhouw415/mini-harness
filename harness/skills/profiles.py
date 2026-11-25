@@ -45,6 +45,4 @@ def skill_profiles(directory: Path, environment: str) -> list[dict[str, str]]:
         if isinstance(description, str) and description.strip():
             profiles.append({"name": entry.name, "description": description.strip()[:1024],
                              "path": document.as_posix()})
-        if len(profiles) == 32:
-            break
     return profiles

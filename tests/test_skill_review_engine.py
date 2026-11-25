@@ -1,5 +1,7 @@
 import json
 import unittest
+import tempfile
+from pathlib import Path
 
 from harness.skills.evolution import review_skills
 
@@ -34,3 +36,33 @@ class SkillReviewTests(unittest.IsolatedAsyncioTestCase):
         async def reply(*args):
             self.fail("Must not call model")
         self.assertEqual((await review_skills({"status": "failed"}, [], reply))["status"], "skipped")
+
+    async def test_review_reads_files_and_returns_update_preimages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "example"
+            (root / "references").mkdir(parents=True)
+            original = "---\nname: example\ndescription: Test\n---\nOriginal steps"
+            (root / "SKILL.md").write_text(original)
+            (root / "references" / "details.md").write_text("original reference")
+            calls = 0
+
+            async def complete(messages, tools):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return {"reasoning_content": "private", "tool_calls": [
+                        {"id": "one", "type": "function", "function": {
+                            "name": "read_skill_file", "arguments": json.dumps({"name": "example"})}},
+                        {"id": "two", "type": "function", "function": {
+                            "name": "read_skill_file", "arguments": json.dumps({"name": "example", "path": "references/details.md"})}},
+                    ]}
+                self.assertNotIn("reasoning_content", messages[-3])
+                self.assertIn("original reference", messages[-1]["content"])
+                return {"content": json.dumps({"action": "update", "name": "example",
+                    "content": original + "\nUpdated", "files": {"references/details.md": "new reference"}})}
+
+            profile = {"name": "example", "description": "Test", "path": str(root / "SKILL.md")}
+            result = await review_skills({"status": "completed"}, [profile], complete)
+            self.assertEqual(result["base_content"], original)
+            self.assertEqual(result["files"]["references/details.md"],
+                             {"content": "new reference", "base_content": "original reference"})
