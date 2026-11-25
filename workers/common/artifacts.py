@@ -26,10 +26,10 @@ from harness.execution.protocol import (
     MAX_ARTIFACT_TEXT_CHARS,
     MAX_IMAGE_BYTES,
 )
-from workers.common.skill_workspace import _directory
+from workers.common.filesystem import _directory
 
 if os.name == "nt":
-    from workers.common.skill_workspace import _windows_entry
+    from workers.common.filesystem import _windows_entry
 
 
 MAX_REQUEST_BYTES = 32 * 1024

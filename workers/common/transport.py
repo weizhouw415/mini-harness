@@ -5,8 +5,10 @@ import base64
 import inspect
 import ipaddress
 import logging
+import os
 import secrets
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -30,6 +32,7 @@ from harness.execution.protocol import (
     validate_artifact_response,
     verify_proof,
 )
+from harness.skills.profiles import skill_profiles
 
 _LOG = logging.getLogger(__name__)
 _MAX_PENDING_REQUESTS = 8
@@ -62,6 +65,27 @@ class _Runtime:
         self.call_ids: set[str] = set()
         self.pending: set[asyncio.Task[None]] = set()
 
+    async def _run_metadata(self) -> dict:
+        configured = os.getenv("MINI_WORKER_SKILLS_DIR")
+        if not configured:
+            return {}
+        capabilities = self.backend.capabilities()
+        if not capabilities.get("bash"):
+            return {}
+        directory = Path(configured).expanduser().resolve()
+        profiles = await asyncio.to_thread(skill_profiles, directory, capabilities["environment"])
+        directory_path = directory.as_posix()
+        if translate := getattr(self.backend, "bash_path", None):
+            try:
+                directory_path = await translate(directory)
+            except (OSError, RuntimeError):
+                _LOG.warning("Could not resolve the configured file directory for Bash")
+                return {}
+        if directory_path != directory.as_posix():
+            for profile in profiles:
+                profile["path"] = f"{directory_path.rstrip('/')}/{profile['name']}/SKILL.md"
+        return {"skill_profiles": profiles, "skill_directory": directory_path}
+
     async def execute(
         self, call_id: str, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
@@ -75,7 +99,7 @@ class _Runtime:
                     raise ValueError("Invalid workspace ID")
                 requested_run = {"run_id": run_id, "workspace_id": workspace_id}
                 if self.active_run == requested_run:
-                    return {}
+                    return await self._run_metadata()
                 if method == "run.resume":
                     raise ValueError("The original workspace is unavailable. Start a new run.")
                 if self.active_run is not None:
@@ -83,7 +107,7 @@ class _Runtime:
                 await self.backend.open_run(run_id, workspace_id)
                 self.active_run = requested_run
                 self.call_ids.clear()
-                return {}
+                return await self._run_metadata()
             if method == "run.close" and self.active_run is None:
                 return {}
             if self.active_run is None or self.active_run["run_id"] != run_id:
@@ -93,18 +117,6 @@ class _Runtime:
                 self.active_run = None
                 self.call_ids.clear()
                 return {}
-            if method == "skills.prepare":
-                prepare = getattr(self.backend, "prepare_skill_workspace", None)
-                skills = params.get("skills")
-                if prepare is None or not isinstance(skills, list):
-                    raise ValueError("Worker skill workspace or snapshot is unavailable")
-                await prepare(run_id, skills)
-                return {}
-            if method == "skills.collect":
-                collect = getattr(self.backend, "collect_skill_candidates", None)
-                if collect is None:
-                    raise ValueError("Worker skill workspace is unavailable")
-                return await collect(run_id)
             if method == "artifacts.stage":
                 stage = getattr(self.backend, "stage_artifact", None)
                 path, encoded = params.get("path"), params.get("data")

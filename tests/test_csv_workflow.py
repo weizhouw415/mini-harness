@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import uvicorn
@@ -44,8 +45,6 @@ environments:
 
 {SKILL_GUIDANCE}
 """
-CSV_SKILL_PATH = ".mini-harness/skills/active/csv-inventory/SKILL.md"
-CSV_CANDIDATE_DIR = ".mini-harness/skills/candidates/csv-inventory"
 REVISED_CSV_SKILL = CSV_SKILL.replace("version: 1.0.0", "version: 1.1.0") + "\nVerify that the upload succeeds.\n"
 
 PROCESS_INVENTORY = """python3 - <<'PY'
@@ -57,20 +56,6 @@ with open('source.csv', newline='') as source, open('processed.csv', 'w', newlin
     for row in rows:
         writer.writerow({'item': row['item'], 'quantity': int(row['quantity']) * 2})
 PY"""
-
-
-def csv_calls(fixture_url: str):
-    return [
-        ("computer_use", {"action": "navigate", "url": fixture_url}),
-        ("computer_use", {"action": "screenshot"}),
-        ("computer_use", {"action": "type", "selector": "#username", "text": "fixture-user"}),
-        ("computer_use", {"action": "type", "selector": "#password", "text": "fixture-password"}),
-        ("computer_use", {"action": "click", "selector": "#login"}),
-        ("computer_use", {"action": "download", "selector": "#download", "path": "source.csv"}),
-        ("bash", {"command": PROCESS_INVENTORY, "timeout": 10}),
-        ("computer_use", {"action": "upload", "selector": "#upload", "path": "processed.csv"}),
-        ("computer_use", {"action": "click", "selector": "#submit"}),
-    ]
 
 
 def computer_command(*arguments: str):
@@ -131,15 +116,15 @@ def streamed_completion(message: dict, *, usage: dict | None = None,
 
 
 class ScriptedModel:
-    def __init__(self, fixture_url: str):
+    def __init__(self, fixture_url: str, document: Path):
         calls = csv_cli_calls(fixture_url)
+        path = shlex.quote(document.as_posix())
         self.calls = {
-            CSV_TASK: calls,
+            CSV_TASK: [*calls, ("bash", {"command": f"cat > {path} <<'EOF'\n{CSV_SKILL}EOF"})],
             CSV_FOLLOWUP: [
-                ("bash", {"command": f"cat {CSV_SKILL_PATH}"}),
+                ("bash", {"command": f"cat {path}"}),
                 *calls,
-                ("bash", {"command": f"mkdir -p {CSV_CANDIDATE_DIR} && "
-                          f"cat > {CSV_CANDIDATE_DIR}/SKILL.md <<'EOF'\n{REVISED_CSV_SKILL}EOF"}),
+                ("bash", {"command": f"cat > {path} <<'EOF'\n{REVISED_CSV_SKILL}EOF"}),
             ],
         }
         self.next_call = {CSV_TASK: 0, CSV_FOLLOWUP: 0}
@@ -148,11 +133,6 @@ class ScriptedModel:
         self.saw_reusable_skill = False
 
     async def complete(self, messages, tools):
-        if not tools:
-            if "double each CSV quantity" not in messages[-1]["content"]:
-                raise AssertionError("Learning did not receive the completed CSV trace")
-            return {"role": "assistant", "content": CSV_SKILL}
-
         exposed_tools = {tool["function"]["name"] for tool in tools}
         if exposed_tools != {"bash"}:
             raise AssertionError(f"Unexpected model tools: {exposed_tools}")
@@ -172,6 +152,8 @@ class ScriptedModel:
             )
 
         if task == CSV_FOLLOWUP and index == 0:
+            if "csv-inventory" not in messages[0]["content"] or SKILL_GUIDANCE in messages[0]["content"]:
+                raise AssertionError("Expected a Skill profile without the body")
             self.saw_previous_response = any(
                 message["role"] == "assistant" and message.get("content") == CSV_RESULT for message in messages
             )
@@ -185,25 +167,6 @@ class ScriptedModel:
         name, arguments = calls[index]
         self.next_call[task] += 1
         return tool_call(f"csv-call-{index}", name, arguments)
-
-
-async def evaluate_held_out_csv(skill, environment, backend, fixture, fixture_url):
-    # Fixture-specific evaluator. The candidate is inspected as data, never executed.
-    if environment != "cloud-browser" or SKILL_GUIDANCE not in skill["content"]:
-        return {"passed": False, "details": "Required CSV processing guidance missing"}
-    try:
-        await backend.open_run("held-out-run", "held-out-workspace")
-        for name, arguments in csv_calls(fixture_url):
-            if name == "bash":
-                result = await backend.bash("held-out-run", **arguments)
-                if result["exit_code"] != 0:
-                    return {"passed": False, "details": "CSV processing failed"}
-            else:
-                await backend.computer("held-out-run", arguments)
-        await eventually(lambda: fixture.uploads)
-        return {"passed": fixture.uploads == [fixture.expected_rows], "details": "Held-out CSV upload"}
-    finally:
-        await backend.close()
 
 
 @asynccontextmanager
@@ -266,10 +229,13 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
             listener.bind(("127.0.0.1", 0))
             address = f"127.0.0.1:{listener.getsockname()[1]}"
-            model = ScriptedModel(f"http://{address}/fixture/")
             fixture = CsvFixture()
-            held_out = CsvFixture((("green, apples", 3), ("plums", 0)))
             data_dir = Path(temporary_directory)
+            skills_dir = data_dir / "skills"
+            document = skills_dir / "csv-inventory" / "SKILL.md"
+            document.parent.mkdir(parents=True)
+            self.enterContext(patch.dict(os.environ, {"MINI_WORKER_SKILLS_DIR": str(skills_dir)}))
+            model = ScriptedModel(f"http://{address}/fixture/", document)
             settings = Settings(
                 data_dir=data_dir / "server",
                 api_token=API_TOKEN,
@@ -278,18 +244,10 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 llm_base_url=f"http://{address}/provider/v1",
                 llm_api_key=PROVIDER_TOKEN,
                 trust_cloud_bash=True,
-                skill_review_interval=0,
             )
 
-            async def evaluator(skill, environment):
-                evaluation_backend = WorkerBackend(workspace_root=data_dir / "evaluation", executable_path=executable)
-                return await evaluate_held_out_csv(
-                    skill, environment, evaluation_backend, held_out, f"http://{address}/held-out/"
-                )
-
-            app = create_app(settings, skill_evaluator=evaluator)
+            app = create_app(settings)
             app.mount("/fixture", fixture.app)
-            app.mount("/held-out", held_out.app)
 
             @app.post("/provider/v1/chat/completions")
             async def provider(request: Request):
@@ -343,14 +301,7 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 artifact = (await client.get(f"/v1/runs/{first_run['id']}/artifacts/{screenshot}")).raise_for_status()
                 self.assertTrue(artifact.content.startswith(b"\x89PNG\r\n\x1a\n"))
 
-                learned = (await client.post(f"/v1/runs/{first_run['id']}/learn")).raise_for_status().json()
-                self.assertEqual(learned["state"], "active")
-                skill_url = f"/v1/skills/{learned['name']}/{learned['version']}"
-                evaluation = (await client.post(
-                    f"{skill_url}/evaluate", json={"environment": "cloud-browser"}
-                )).raise_for_status().json()
-                self.assertTrue(evaluation["evaluations"]["cloud-browser"]["passed"], evaluation)
-                self.assertEqual(held_out.uploads, [held_out.expected_rows])
+                self.assertEqual(document.read_text(), CSV_SKILL)
 
                 await eventually(lambda: self.worker_is_ready(client, worker))
                 followup = await self.start_and_wait(client, CSV_FOLLOWUP, first_run["session_id"])
@@ -358,9 +309,7 @@ class CsvWorkflowTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(followup["session_id"], first_run["session_id"])
                 self.assertTrue(model.saw_previous_response)
                 self.assertTrue(model.saw_reusable_skill)
-                index = (await client.get("/v1/skills")).raise_for_status().json()
-                self.assertEqual({skill["version"]: skill["state"] for skill in index},
-                                 {"1.0.0": "deprecated", "1.1.0": "active"})
+                self.assertEqual(document.read_text(), REVISED_CSV_SKILL)
                 await eventually(lambda: len(fixture.uploads) == 2)
                 self.assertEqual(fixture.login_count, 2)
 

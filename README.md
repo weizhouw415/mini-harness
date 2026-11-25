@@ -5,7 +5,7 @@
 Mini Harness 采用单工具架构。一个 Agent Loop 统一推理、执行和观察，模型通过一个执行入口调用 Worker 上的命令、程序和可复用技能。
 
 - **Bash 是唯一的模型执行接口。** 优先用命令、脚本、SDK 和 API 处理任务。
-- **CLI 封装能力。** `harness computer` 操作界面，`harness view` 检查产物，`harness register` 交付文件。Skill 和 Env 是同一命令体系里可继续扩展的入口，目前通过工作区技能索引和 Worker 能力声明发现。
+- **CLI 封装能力。** `harness computer` 操作界面，`harness view` 检查产物，`harness register` 交付文件。
 - **Artifact 承载感知。** 上传文件、截图和运行产物共享文件引用与多模态观察。支持视觉的模型可以直接查看画面，再据此验证和修正结果。
 - **Skills 沉淀可复用的能力。** Agent 将有效的流程和脚本保存到技能库，后续任务可以直接查找和复用。
 - **Harness 是稳定的运行时。** 运行时负责绑定 Worker、审批、工作区、事件记录和恢复。新能力可以通过 CLI、Skill 或脚本扩展，模型接口和 Agent Loop 保持稳定。
@@ -94,20 +94,43 @@ harness computer scroll down 500
 
 远程连接应使用 TLS。服务端可用 `HARNESS_WORKER_SECRETS` 的 JSON 映射为每个 Worker 配置独立密钥。WebSocket 通过双向 HMAC 握手认证，明文 WebSocket 只用于本机开发或专用 Docker 网络。
 
-## Skill 学习与复用
+## Skill 文件
 
-Agent 先看到 Skill 名称和描述，再按需读取正文或附带文件。通过独立的 Bash 工具调用运行
-`harness skill list`、`harness skill view NAME [PATH]` 或 `harness skill manage`。创建和修订由服务端直接保存，成功后即可复用。
-遇到可复用的流程、解决了难题或得到用户纠正时，Agent 优先修补已有 Skill。
+每个 Skill 存在 `<技能目录>/<名称>/SKILL.md`，附属文件可以放在同一目录下。
+`SKILL.md` 的 YAML 头部包含 `name` 和 `description`，也可以用 `environments` 列出适用的 Worker 环境。
+每个新 Run 只把名称、描述和文件路径加入系统提示。正文按需用 Bash 读取，增、改、删也直接操作文件。
 
-成功完成的 Run 达到 10 次工具迭代后，Harness 会在后台复盘运行轨迹。复盘可以读取、创建和修订 Skill，
-只使用技能库命令。通过 `HARNESS_SKILL_REVIEW_INTERVAL` 调整间隔，设置为 `0` 可关闭后台复盘。
-也可以运行 `mini-harness learn RUN_ID`，从一条已完成的任务轨迹主动提炼并保存 Skill。
+本地启动时，Worker 共用 `HARNESS_DATA_DIR/skills`（默认 `.harness/skills/`），可用 `HARNESS_SKILLS_DIR` 覆盖。
+Docker Compose 的 Worker 共用 `/skills` 卷。独立 Worker 可通过 `MINI_WORKER_SKILLS_DIR` 指向自己的持久目录或共享挂载。
+服务升级时会一次性把旧目录中的启用版本和附属文件导入文件库，原目录保留为迁移备份。
 
-`mini-harness skills --environment macos-desktop` 查看技能库，`mini-harness rollback NAME VERSION --yes`
-恢复历史版本。Skill 可以声明适用的 Worker 环境，`available` 表示在所查询的环境可用。
-升级旧技能库时，还没有启用版本的 Skill 会自动启用最近保存的候选。版本文件和附带文件位于
-`HARNESS_DATA_DIR/skills/versions/<name>/<version>/`，状态保存在同级 Skill 库的 `catalog.sqlite`。
+成功任务包含至少 8 次工具调用时，后台会复盘运行记录，判断是否有经过验证、可跨任务复用的方法。复盘结果记录在任务中；新技能写入服务端技能目录，已有技能的修改保留为候选，不会覆盖原文件。复盘失败不影响原任务结果。当前复盘使用运行轨迹，不会在工作区销毁前复制全部源码；未出现在轨迹中的文件不能作为复盘证据。复盘会额外调用模型。
+
+本地和 Compose 默认由服务端与 Worker 共享技能目录；独立 Worker 若使用不同的 `MINI_WORKER_SKILLS_DIR`，服务端新增的技能不会自动同步到该 Worker。
+
+## 记忆
+
+在 Web UI 的「设置 → 记忆」中可以启用记忆、控制自动提取和启用个人跨会话记忆。记忆默认关闭。自动提取开关默认打开，启用记忆后生效。关闭记忆会停止任务中的记忆召回、模型记忆命令和后台学习，已保存的记忆仍可通过管理接口查看或删除。设置保存在 `HARNESS_DATA_DIR/memory-settings.json`，修改后对后续模型步骤和后台任务生效。
+
+默认使用会话范围，记忆仅在所属 Session 中召回。启用「个人跨会话记忆」后，Agent 保存和自动提取的记忆使用实例级个人范围，可以供此实例的其他会话使用。实例使用共享的 API Token，个人范围适用于同一使用者的部署。服务端集中保存记忆，桌面和浏览器 Worker 使用同一套数据。
+
+任务开始时会根据用户请求检索相关记忆。模型需要查看更多信息时，可以在 Bash 中单独执行 `harness memory search QUERY`、`harness memory get ID` 或 `harness memory source ID`。用户明确要求记住或忘记时，模型也可以通过 `harness memory remember KEY VALUE` 和 `harness memory forget ID` 操作。自动提取会在 Run 成功结束后读取用户输入，使用当前配置的模型提出候选，并通过持久化任务队列处理。提取发生在后台，后续会话开始时任务可能还在处理。检索使用精确文本、SQLite 全文索引和中文短词匹配。
+
+`harness memory profile` 展示当前可访问的偏好。启用记忆后，长任务达到上下文阈值时会生成工作检查点并保留原始运行记录。后台每天整理可追溯的相似记忆，处理带到期时间的短期记忆，并为复杂任务生成情景摘要。自动提取和整理会调用当前配置的模型，产生额外请求。
+
+CLI 管理命令需要 `HARNESS_API_TOKEN` 和已有 Session ID。`remember` 对同一范围、类型和键更新记忆，可通过 `--expected-version` 检查当前版本。个人范围需要先在设置中启用。
+
+```bash
+mini-harness memory --session SESSION_ID remember --key design.style --value '喜欢简洁设计'
+mini-harness memory --session SESSION_ID search '简洁'
+mini-harness memory --session SESSION_ID profile
+mini-harness memory --session SESSION_ID get MEMORY_ID
+mini-harness memory --session SESSION_ID source MEMORY_ID
+mini-harness memory --session SESSION_ID remember --key design.style --value '喜欢蓝白配色' --expected-version 1
+mini-harness memory --session SESSION_ID forget MEMORY_ID
+```
+
+记忆、版本、来源引用和后台任务保存在 `HARNESS_DATA_DIR/runs.sqlite3`。遗忘会删除该记忆及其保存版本和索引，并阻止旧任务重新提取同一条记忆。原始会话、运行轨迹和上传文件按原有方式保留，可能仍包含用户最初提供的信息。显式重新保存可恢复记忆。
 
 ## API 与验收
 
@@ -115,7 +138,7 @@ Agent 先看到 Skill 名称和描述，再按需读取正文或附带文件。�
 更新代码后需重启服务和 Worker 才会加载新版本；请先处理正在运行、等待审批或暂停的任务，因为重启 Worker 会清理其运行工作区。
 首次运行时在「设置」中填写供应商名称、OpenAI 兼容的 Base URL、模型名及服务需要的 API Key。可以保存多组供应商配置，并随时启用其中一组；启用后，后续模型请求（包括进行中任务的下一次请求）使用该配置。
 设置保存在 `HARNESS_DATA_DIR/model.json`，下次启动会优先使用已保存的配置；未保存时使用环境变量。已有的单模型配置会自动保留为一组供应商配置。
-在「设置 → 能力设置」中可以分别启用或关闭文件预览（`view`）、文件交付（`register`）和界面操作（`computer_use`）。默认均启用，Bash 始终可用；全部关闭时，模型仅通过 Bash 执行任务。设置保存在 `HARNESS_DATA_DIR/capabilities.json`，每个任务开始时固定一份配置，暂停恢复时沿用；修改只影响之后开始的任务。关闭能力时，需同时更新独立运行的 Worker 到支持能力开关的版本。
+在「设置 → 任务能力」中可以分别启用或关闭文件预览（`view`）、文件交付（`register`）和界面操作（`computer_use`）。默认均启用，Bash 始终可用；全部关闭时，模型仅通过 Bash 执行任务。设置保存在 `HARNESS_DATA_DIR/capabilities.json`，每个任务开始时固定一份配置，暂停恢复时沿用；修改只影响之后开始的任务。关闭能力时，需同时更新独立运行的 Worker 到支持能力开关的版本。
 免 Token 连接只用于直接访问本机回环地址的浏览器页面，CLI 和外部 API 客户端仍使用 `HARNESS_API_TOKEN`。
 侧栏显示最近 100 个对话及其运行状态，包括通过 CLI 创建的会话。对话运行时可点击「新建对话」开始另一条任务，也可以从侧栏切回查看回复和审批。每个对话在当前轮结束后可继续发送消息。
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。

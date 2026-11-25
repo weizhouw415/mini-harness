@@ -27,23 +27,26 @@ def main():
     local = commands.add_parser("local", help="Start the local server and workers")
     local.add_argument("--headless", action="store_true", help="Start only the cloud browser worker")
     commands.add_parser("workers")
-    index = commands.add_parser("skills")
-    index.add_argument("--environment")
-    for verb in ("status", "trace", "resume", "cancel", "learn"):
+    memory = commands.add_parser("memory", help="Manage saved memories")
+    memory.add_argument("--session", required=True, help="Session that owns the memory")
+    memory_commands = memory.add_subparsers(dest="memory_command", required=True)
+    memory_commands.add_parser("profile")
+    search = memory_commands.add_parser("search")
+    search.add_argument("query", nargs="?", default="")
+    for action in ("get", "source", "forget"):
+        memory_commands.add_parser(action).add_argument("id")
+    remember = memory_commands.add_parser("remember")
+    remember.add_argument("--key", required=True)
+    remember.add_argument("--value", required=True)
+    remember.add_argument("--type", dest="kind", choices=("preference", "fact", "project", "episode", "short_term"), default="preference")
+    remember.add_argument("--scope", choices=("session", "global"), default="session")
+    remember.add_argument("--expected-version", type=int)
+    for verb in ("status", "trace", "resume", "cancel"):
         commands.add_parser(verb).add_argument("run_id")
     approval = commands.add_parser("approve")
     approval.add_argument("run_id")
     approval.add_argument("call_id")
     approval.add_argument("decision", choices=["allow", "deny"])
-    for verb in ("evaluate", "publish", "rollback"):
-        sub = commands.add_parser(verb)
-        sub.add_argument("name")
-        sub.add_argument("version")
-        if verb == "evaluate":
-            sub.add_argument("environment", choices=["cloud-browser", "macos-desktop", "windows-desktop"])
-        else:
-            sub.add_argument("--yes", required=True, action="store_true")
-
     args = parser.parse_args()
     if args.command == "local":
         from harness.local import main as local_main
@@ -83,13 +86,23 @@ def main():
                         result = send("GET", f"/v1/runs/{result['id']}")
             elif command == "workers":
                 result = send("GET", "/v1/workers")
-            elif command == "skills":
-                params = {"environment": args.environment} if args.environment else {}
-                result = send("GET", "/v1/skills", params=params)
-            elif command in {"evaluate", "publish", "rollback"}:
-                path = f"/v1/skills/{quote(args.name, safe='')}/{quote(args.version, safe='')}/{command}"
-                body = {"environment": args.environment} if command == "evaluate" else {"approved": args.yes}
-                result = send("POST", path, json=body)
+            elif command == "memory":
+                action = args.memory_command
+                params = {"session_id": args.session}
+                if action == "profile":
+                    result = send("GET", "/v1/memory/profile", params=params)
+                elif action == "search":
+                    result = send("GET", "/v1/memory", params={**params, "q": args.query})
+                elif action == "remember":
+                    result = send("POST", "/v1/memory", json={
+                        **params, "key": args.key, "content": args.value, "kind": args.kind,
+                        "scope": args.scope, "expected_version": args.expected_version,
+                    })
+                else:
+                    path = "/v1/memory/" + quote(args.id, safe="")
+                    if action == "source":
+                        path += "/source"
+                    result = send("DELETE" if action == "forget" else "GET", path, params=params)
             else:
                 path = "/v1/runs/" + quote(args.run_id, safe="")
                 if command == "status":

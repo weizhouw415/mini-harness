@@ -12,7 +12,6 @@ from workers.common.browser import BROWSER_ACTIONS, BrowserController, BrowserSe
 from workers.common.computer_cli import run_computer_cli
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
-from workers.common.skill_workspace import collect_skill_candidates, prepare_skill_workspace
 
 
 @dataclass
@@ -21,7 +20,6 @@ class Run:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_session: BrowserSession = field(default_factory=BrowserSession)
     closed: bool = False
-    skill_workspace_prepared: bool = False
 
 
 class WorkerBackend:
@@ -38,7 +36,7 @@ class WorkerBackend:
     def capabilities(self) -> dict:
         return {
             "environment": "cloud-browser", "desktop": False, "bash": True,
-            "safe_bash_path": True, "skill_workspace": True, "artifact_workspace": True,
+            "safe_bash_path": True, "artifact_workspace": True,
             "cli_capability_toggles": True,
             "computer": True, "computer_cli": True, "download": True, "upload": True, "actions": list(BROWSER_ACTIONS),
             "computer_targets": {"browser": list(BROWSER_ACTIONS)},
@@ -58,22 +56,6 @@ class WorkerBackend:
             return self._runs[run_id]
         except KeyError:
             raise ValueError("Unknown run") from None
-
-    async def prepare_skill_workspace(self, run_id: str, skills: list[dict]) -> None:
-        run = self._get_run(run_id)
-        async with run.lock:
-            if run.closed:
-                raise ValueError("Run is closed")
-            if not run.skill_workspace_prepared:
-                prepare_skill_workspace(run.path, skills)
-                run.skill_workspace_prepared = True
-
-    async def collect_skill_candidates(self, run_id: str) -> dict:
-        run = self._get_run(run_id)
-        async with run.lock:
-            if run.closed or not run.skill_workspace_prepared:
-                raise ValueError("Run has no available skill workspace")
-            return collect_skill_candidates(run.path)
 
     async def stage_artifact(self, run_id: str, path: str, offset: int, total: int, data: bytes) -> None:
         run = self._get_run(run_id)

@@ -712,7 +712,7 @@ dialog input:not([type="checkbox"]) {
 .capability-option strong { font-size: 14px; }
 .capability-option small { color: var(--muted); font-size: 12px; font-weight: 400; }
 .capability-option input { flex: none; width: 18px; height: 18px; accent-color: var(--accent); }
-#capabilities-form .dialog-actions { margin-top: 16px; }
+#capabilities-form .dialog-actions, #memory-settings-form .dialog-actions { margin-top: 16px; }
 #model-error { margin: 12px 0 0; font-size: 13px; }
 #key-hint { margin: -9px 0 12px; color: var(--muted); font-size: 12px; }
 #clear-key-label { display: block; margin-bottom: 12px; color: var(--muted); }
@@ -1343,3 +1343,5 @@ dialog input:not([type="checkbox"]) {
     --trace-state-bg: #492734;
   }
 }
+
+.skill-review-status { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }

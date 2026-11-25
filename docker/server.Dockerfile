@@ -11,7 +11,7 @@ RUN --mount=type=secret,id=pip-ca \
     if [ -f /run/secrets/pip-ca ]; then export PIP_CERT=/run/secrets/pip-ca; fi \
     && pip install --no-cache-dir . \
     && useradd --system --uid 10001 harness \
-    && install -d -m 0700 -o harness -g harness /data
+    && install -d -m 0700 -o harness -g harness /data /skills
 
 ENV PYTHONUNBUFFERED=1 HARNESS_DATA_DIR=/data
 USER harness

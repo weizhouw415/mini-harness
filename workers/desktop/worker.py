@@ -18,7 +18,6 @@ from workers.common.artifacts import add_artifact_content, artifact_requests, st
 from workers.common.computer_cli import run_computer_cli
 from workers.common.config import env_flag
 from workers.common.shell import run_shell
-from workers.common.skill_workspace import collect_skill_candidates, prepare_skill_workspace
 
 
 ACTIONS = (*GUI_ACTIONS, "observe", "press")
@@ -40,7 +39,6 @@ class Run:
     path: Path
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     closed: bool = False
-    skill_workspace_prepared: bool = False
 
 
 class WorkerBackend:
@@ -63,7 +61,7 @@ class WorkerBackend:
         actions = list(ACTIONS) if self.desktop_enabled else []
         return {
             "environment": self.environment, "desktop": True, "bash": self.bash_enabled,
-            "safe_bash_path": True, "skill_workspace": self.bash_enabled and self.desktop_enabled,
+            "safe_bash_path": True,
             "artifact_workspace": self.desktop_enabled, "cli_capability_toggles": True,
             "computer": self.desktop_enabled, "computer_cli": self.desktop_enabled,
             "download": False, "upload": False,
@@ -99,28 +97,6 @@ class WorkerBackend:
             return self._runs[run_id]
         except KeyError:
             raise ValueError("Unknown run") from None
-
-    async def prepare_skill_workspace(self, run_id: str, skills: list[dict]) -> None:
-        if not self.bash_enabled:
-            raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
-        run = self._get_run(run_id)
-        async with run.lock:
-            self.check_available()
-            if run.closed:
-                raise ValueError("Run is closed")
-            if not run.skill_workspace_prepared:
-                prepare_skill_workspace(run.path, skills)
-                run.skill_workspace_prepared = True
-
-    async def collect_skill_candidates(self, run_id: str) -> dict:
-        if not self.bash_enabled:
-            raise PermissionError("Set MINI_DESKTOP_BASH=1 on the desktop to authorize local Bash")
-        run = self._get_run(run_id)
-        async with run.lock:
-            self.check_available()
-            if run.closed or not run.skill_workspace_prepared:
-                raise ValueError("Run has no available skill workspace")
-            return collect_skill_candidates(run.path)
 
     async def stage_artifact(self, run_id: str, path: str, offset: int, total: int, data: bytes) -> None:
         run = self._get_run(run_id)
@@ -346,15 +322,22 @@ class WorkerBackend:
             return [executable, *options]
         if kind == "wsl":
             executable = configured_path or "wsl.exe"
-            conversion = await run_shell(
-                [executable, "--exec", "wslpath", "-a", "-u", str(path)],
-                cwd=path, environment=self._bash_environment(), timeout=10,
-            )
-            linux_path = conversion["stdout"].strip()
-            if conversion["exit_code"] != 0 or not linux_path.startswith("/"):
-                raise RuntimeError("WSL could not convert the run workspace path")
+            linux_path = await self.bash_path(path)
             return [executable, "--cd", linux_path, "--exec", "/bin/bash", *options]
         raise ValueError("MINI_DESKTOP_BASH_KIND must be git-bash or wsl")
+
+    async def bash_path(self, path: Path) -> str:
+        if sys.platform != "win32" or os.getenv("MINI_DESKTOP_BASH_KIND", "git-bash") != "wsl":
+            return path.as_posix()
+        executable = os.getenv("MINI_DESKTOP_BASH_PATH") or "wsl.exe"
+        conversion = await run_shell(
+            [executable, "--exec", "wslpath", "-a", "-u", str(path)],
+            cwd=path, environment=self._bash_environment(), timeout=10,
+        )
+        linux_path = conversion["stdout"].strip()
+        if conversion["exit_code"] != 0 or not linux_path.startswith("/"):
+            raise RuntimeError("WSL could not convert the path")
+        return linux_path
 
     @staticmethod
     def _bash_environment() -> dict[str, str]:

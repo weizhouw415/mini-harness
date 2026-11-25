@@ -6,6 +6,7 @@
   <title>Mini Harness</title>
   <link rel="stylesheet" href="/ui/style.css">
   <link rel="stylesheet" href="/ui/markdown.css">
+  <link rel="stylesheet" href="/ui/settings.css">
   <script src="/ui/marked.umd.js" defer></script>
   <script src="/ui/purify.min.js" defer></script>
   <script src="/ui/markdown.js" defer></script>
@@ -153,57 +154,71 @@
       <div id="file-preview" aria-live="polite"></div>
     </div>
   </aside>
-  <dialog id="model-dialog" aria-labelledby="model-dialog-title">
-    <h2 id="model-dialog-title">设置</h2>
-    <div id="provider-list-view">
-      <h3>模型供应商</h3>
-      <p class="provider-intro">保存多个模型供应商，随时切换当前使用的配置。</p>
-      <p class="provider-intro">启用、修改或删除当前配置会影响进行中任务的后续模型请求。</p>
-      <div id="provider-list" aria-live="polite"></div>
-      <div class="dialog-actions">
-        <button id="close-settings" type="button">关闭</button>
-        <button id="open-capabilities" type="button">能力设置</button>
-        <button id="add-provider" class="primary" type="button">添加供应商</button>
+  <dialog id="model-dialog" class="settings-dialog" aria-labelledby="model-dialog-title">
+    <header class="settings-header">
+      <div><p class="settings-eyebrow">偏好设置</p><h2 id="model-dialog-title">设置</h2></div>
+      <button id="close-settings" class="settings-close" type="button" aria-label="关闭设置" title="关闭设置">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </header>
+    <div class="settings-layout">
+      <nav class="settings-nav" role="tablist" aria-label="设置分类">
+        <button id="tab-providers" class="settings-tab" type="button" role="tab" aria-selected="true" aria-controls="panel-providers">
+          <span class="settings-tab-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h6M11 16.5h6"/></svg></span><span>模型供应商<small>连接与模型</small></span>
+        </button>
+        <button id="tab-capabilities" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-capabilities" tabindex="-1">
+          <span class="settings-tab-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg></span><span>任务能力<small>工具与操作</small></span>
+        </button>
+        <button id="tab-memory" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-memory" tabindex="-1">
+          <span class="settings-tab-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M12 20V4m0 2a3 3 0 0 0-5-1 3 3 0 0 0-2 5 3.5 3.5 0 0 0 1 6 3 3 0 0 0 6 2m0-12a3 3 0 0 1 5-1 3 3 0 0 1 2 5 3.5 3.5 0 0 1-1 6 3 3 0 0 1-6 2"/></svg></span><span>记忆<small>记忆与个性化</small></span>
+        </button>
+      </nav>
+      <div class="settings-content">
+        <section id="panel-providers" class="settings-panel" role="tabpanel" aria-labelledby="tab-providers">
+          <div id="provider-list-view">
+            <div class="settings-panel-header"><div><h3 class="settings-panel-heading">模型供应商</h3><p class="settings-panel-description">管理模型连接，选择任务使用的供应商。</p></div><button id="add-provider" class="primary" type="button">添加供应商</button></div>
+            <p class="settings-note">启用、修改或删除当前配置会影响进行中任务的后续模型请求。</p>
+            <div id="provider-list" aria-live="polite"></div>
+          </div>
+          <form id="model-form" hidden>
+            <div class="settings-panel-header"><div><h3 id="provider-form-title" class="settings-panel-heading">添加供应商</h3><p class="settings-panel-description">填写模型服务的连接信息。</p></div></div>
+            <label for="provider-name">供应商名称</label>
+            <input id="provider-name" required maxlength="256" placeholder="例如 OpenAI、公司内部服务">
+            <label for="base-url">Base URL</label>
+            <input id="base-url" type="url" required maxlength="2048" placeholder="https://api.example.com/v1">
+            <label for="api-key">API Key</label>
+            <input id="api-key" type="password" autocomplete="off" maxlength="8192" aria-describedby="key-hint">
+            <p id="key-hint"></p>
+            <label id="clear-key-label" hidden><input id="clear-key" type="checkbox"> 清除已保存的 API Key</label>
+            <label for="model-name">模型名</label>
+            <input id="model-name" required maxlength="256" placeholder="模型 ID">
+            <div class="dialog-actions settings-panel-actions"><button id="cancel-provider" type="button">返回</button><button class="primary" type="submit">保存</button></div>
+          </form>
+        </section>
+        <section id="panel-capabilities" class="settings-panel" role="tabpanel" aria-labelledby="tab-capabilities" hidden>
+          <form id="capabilities-form">
+            <div class="settings-panel-header"><div><h3 class="settings-panel-heading">任务能力</h3><p class="settings-panel-description">选择任务可以使用的工具和操作。</p></div></div>
+            <p class="settings-note">Bash 始终可用。修改仅影响之后启动的任务。</p>
+            <label class="capability-option" for="capability-view"><span><strong>文件预览</strong><small>查看文件和图像预览。</small></span><input id="capability-view" type="checkbox" role="switch"></label>
+            <label class="capability-option" for="capability-register"><span><strong>交付文件</strong><small>将任务生成的文件提供给用户下载。</small></span><input id="capability-register" type="checkbox" role="switch"></label>
+            <label class="capability-option" for="capability-computer-use"><span><strong>界面操作</strong><small>观察和操作浏览器或桌面。</small></span><input id="capability-computer-use" type="checkbox" role="switch"></label>
+            <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
+          </form>
+        </section>
+        <section id="panel-memory" class="settings-panel" role="tabpanel" aria-labelledby="tab-memory" hidden>
+          <form id="memory-settings-form">
+            <div class="settings-panel-header"><div><h3 class="settings-panel-heading">记忆</h3><p class="settings-panel-description">管理记忆功能及其使用范围。</p></div></div>
+            <p class="settings-note">关闭记忆后，已保存的记忆仍会保留。</p>
+            <label class="capability-option" for="memory-enabled"><span><strong>启用记忆</strong><small>在任务中使用和管理保存的记忆。</small></span><input id="memory-enabled" type="checkbox" role="switch"></label>
+            <label class="capability-option" for="memory-automatic"><span><strong>自动提取记忆</strong><small>任务完成后，从用户输入中提取有长期价值的信息。</small></span><input id="memory-automatic" type="checkbox" role="switch"></label>
+            <label class="capability-option" for="memory-personal"><span><strong>个人跨会话记忆</strong><small>允许此实例的不同会话使用共同的个人记忆。</small></span><input id="memory-personal" type="checkbox" role="switch"></label>
+            <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
+          </form>
+        </section>
+        <p id="model-error" role="alert" hidden></p>
+        <p id="settings-status" role="status" aria-live="polite" hidden></p>
       </div>
     </div>
-    <form id="model-form" hidden>
-      <h3 id="provider-form-title">添加供应商</h3>
-      <label for="provider-name">供应商名称</label>
-      <input id="provider-name" required maxlength="256" placeholder="例如 OpenAI、公司内部服务">
-      <label for="base-url">Base URL</label>
-      <input id="base-url" type="url" required maxlength="2048" placeholder="https://api.example.com/v1">
-      <label for="api-key">API Key</label>
-      <input id="api-key" type="password" autocomplete="off" maxlength="8192" aria-describedby="key-hint">
-      <p id="key-hint"></p>
-      <label id="clear-key-label" hidden><input id="clear-key" type="checkbox"> 清除已保存的 API Key</label>
-      <label for="model-name">模型名</label>
-      <input id="model-name" required maxlength="256" placeholder="模型 ID">
-      <div class="dialog-actions">
-        <button id="cancel-provider" type="button">返回</button>
-        <button class="primary" type="submit">保存</button>
-      </div>
-    </form>
-    <form id="capabilities-form" hidden>
-      <h3>能力设置</h3>
-      <p class="capability-intro">Bash 始终可用。能力设置仅影响之后启动的任务。</p>
-      <label class="capability-option" for="capability-view">
-        <span><strong>文件预览</strong><small>通过 harness view 查看文件和图像预览。</small></span>
-        <input id="capability-view" type="checkbox" role="switch">
-      </label>
-      <label class="capability-option" for="capability-register">
-        <span><strong>交付文件</strong><small>通过 harness register 将文件提供给用户下载。</small></span>
-        <input id="capability-register" type="checkbox" role="switch">
-      </label>
-      <label class="capability-option" for="capability-computer-use">
-        <span><strong>界面操作</strong><small>通过 harness computer 观察和操作浏览器或桌面。</small></span>
-        <input id="capability-computer-use" type="checkbox" role="switch">
-      </label>
-      <div class="dialog-actions">
-        <button id="cancel-capabilities" type="button">返回</button>
-        <button class="primary" type="submit">保存</button>
-      </div>
-    </form>
-    <p id="model-error" role="alert" hidden></p>
   </dialog>
 </body>
 </html>

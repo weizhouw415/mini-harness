@@ -91,14 +91,14 @@ function requestErrorMessage(path, status, data) {
   const details = Array.isArray(data.detail) ? data.detail : [];
   const oldAssetRoute = details.some((item) =>
     Array.isArray(item.loc) && item.loc[0] === "path" && item.loc[1] === "asset");
-  if (["/ui/providers", "/ui/capabilities"].includes(path) &&
+  if (["/ui/providers", "/ui/capabilities", "/ui/memory/settings"].includes(path) &&
       (status === 404 || (status === 422 && oldAssetRoute))) {
     return "页面与服务端版本不一致。请先处理进行中或暂停的任务，再重启 Mini Harness 并刷新页面。";
   }
   if (typeof data.detail === "string") return data.detail;
   if (status === 422 && details.length) {
     // Only show known field names and fixed messages, never server-provided input values.
-    const fields = new Set(["name", "model", "base_url", "api_key", "view", "register", "computer_use",
+    const fields = new Set(["name", "model", "base_url", "api_key", "view", "register", "computer_use", "enabled", "automatic", "personal",
       "task", "worker_id", "worker_target", "approval_mode", "session_id", "upload_ids", "command", "timeout"]);
     const field = (Array.isArray(details[0].loc) ? details[0].loc : []).find((part) => fields.has(part));
     const kind = String(details[0].type || "");
@@ -971,6 +971,11 @@ function appendEvents(view, events, id) {
       view.generation = null;
       view.phase = data.calls?.length ? "preparing" : "finishing";
       if (!data.calls?.length) view.finalUpdate = generation.update?.entry;
+    } else if (type === "skill_review") {
+      const labels = { queued: "技能复盘排队中", running: "正在提炼技能", completed: "技能已沉淀", proposed: "已生成技能候选", skipped: "本次无需沉淀技能", failed: "技能复盘失败" };
+      view.skillReviewPending = ["queued", "running"].includes(data.status);
+      view.skillReview.hidden = false;
+      view.skillReview.textContent = (labels[data.status] || "技能复盘") + (data.name ? "：" + data.name : "") + (data.reason ? " · " + data.reason : "");
     } else if (type === "worker_bound") {
       addTraceEntry(view, "screen", "已连接 Worker", data.worker_id, event.created_at);
     } else if (type === "model_compatibility" && data.reasoning_effort === "none") {
@@ -1086,11 +1091,14 @@ function createTurn(value) {
   outputHeading.append(traceIcon("folder"), "运行产物");
   outputs.append(outputHeading, outputFiles);
   const response = element("div", undefined, "turn-response");
-  response.append(trace, answer, outputs);
+  const skillReview = element("p", undefined, "skill-review-status");
+  skillReview.hidden = true;
+  skillReview.setAttribute("role", "status");
+  response.append(trace, answer, outputs, skillReview);
   const prompt = promptMessage(value.task);
   node.append(prompt.node, response);
   const view = {
-    node, trace, timeline, tracePending, traceError, traceCount, traceStatusLabel, answer,
+    node, trace, timeline, tracePending, traceError, traceCount, traceStatusLabel, answer, skillReview,
     uploads: prompt.files, outputs, outputFiles,
     raw, traceTotals, rawEntries, after: 0, eventLog: [], logRendered: 0, calls: new Map(), plannedCalls: new Map(),
     toolCallCount: 0, modelResponseCount: 0,
@@ -1338,7 +1346,6 @@ function modelError(message = "") {
 function showProviderList() {
   $("api-key").value = "";
   $("model-form").hidden = true;
-  $("capabilities-form").hidden = true;
   $("provider-list-view").hidden = false;
   modelError();
   const list = $("provider-list");
@@ -1418,6 +1425,10 @@ async function openSettings(onlyIfMissing = false) {
   try {
     const config = await loadModel();
     if ((!onlyIfMissing || !config.configured) && !$("model-dialog").open) {
+      settingsSession++;
+      settingsLoaded = { capabilities: false, memory: false };
+      settingsLoading = { capabilities: false, memory: false };
+      selectSettingsTab("providers");
       showProviderList();
       $("model-dialog").showModal();
       if (!config.providers.length) editProvider();
@@ -1433,47 +1444,114 @@ async function openSettings(onlyIfMissing = false) {
 
 $("add-provider").addEventListener("click", () => editProvider());
 $("cancel-provider").addEventListener("click", showProviderList);
-$("open-capabilities").addEventListener("click", async () => {
-  const button = $("open-capabilities");
-  button.disabled = true;
-  modelError();
-  try {
-    const capabilities = await api("/ui/capabilities");
-    $("capability-view").checked = capabilities.view;
-    $("capability-register").checked = capabilities.register;
-    $("capability-computer-use").checked = capabilities.computer_use;
-    $("provider-list-view").hidden = true;
-    $("capabilities-form").hidden = false;
-    $("capability-view").focus();
-  } catch (error) {
-    modelError(error.message);
-  } finally {
-    button.disabled = false;
+const settingsTabs = ["providers", "capabilities", "memory"];
+let settingsLoaded = { capabilities: false, memory: false };
+let settingsLoading = { capabilities: false, memory: false };
+let settingsSession = 0;
+let activeSettingsTab = "providers";
+
+function settingsStatus(message = "") {
+  $("settings-status").textContent = message;
+  $("settings-status").hidden = !message;
+}
+
+async function selectSettingsTab(name, focus = false) {
+  activeSettingsTab = name;
+  for (const tab of settingsTabs) {
+    const selected = tab === name;
+    $("tab-" + tab).setAttribute("aria-selected", String(selected));
+    $("tab-" + tab).tabIndex = selected ? 0 : -1;
+    $("panel-" + tab).hidden = !selected;
   }
-});
-$("cancel-capabilities").addEventListener("click", showProviderList);
-$("capabilities-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const submit = $("capabilities-form").querySelector("[type=submit]");
-  submit.disabled = true;
   modelError();
+  settingsStatus();
+  if (focus) $("tab-" + name).focus();
+  if (name === "providers" || settingsLoaded[name]) return;
+
+  if (settingsLoading[name]) { settingsStatus("正在读取设置…"); return; }
+  settingsLoading[name] = true;
+  const session = settingsSession;
+  const form = $(name === "capabilities" ? "capabilities-form" : "memory-settings-form");
+  const controls = form.querySelectorAll("input, button");
+  controls.forEach((control) => { control.disabled = true; });
+  settingsStatus("正在读取设置…");
   try {
-    await api("/ui/capabilities", {
-      method: "PUT",
-      body: {
-        view: $("capability-view").checked,
-        register: $("capability-register").checked,
-        computer_use: $("capability-computer-use").checked,
-      },
-    });
-    showProviderList();
+    const data = await api(name === "capabilities" ? "/ui/capabilities" : "/ui/memory/settings");
+    if (session !== settingsSession) return;
+    if (name === "capabilities") {
+      $("capability-view").checked = data.view;
+      $("capability-register").checked = data.register;
+      $("capability-computer-use").checked = data.computer_use;
+    } else {
+      $("memory-enabled").checked = data.enabled;
+      $("memory-automatic").checked = data.automatic;
+      $("memory-personal").checked = data.personal;
+    }
+    settingsLoaded[name] = true;
+    if (activeSettingsTab === name) settingsStatus();
+  } catch (error) {
+    if (session === settingsSession && activeSettingsTab === name) {
+      settingsStatus();
+      modelError(error.message + "，请切换页签后重试。");
+    }
+  } finally {
+    if (session === settingsSession) {
+      settingsLoading[name] = false;
+      controls.forEach((control) => { control.disabled = !settingsLoaded[name]; });
+    }
+  }
+}
+
+for (const name of settingsTabs) {
+  $("tab-" + name).addEventListener("click", () => void selectSettingsTab(name));
+  $("tab-" + name).addEventListener("keydown", (event) => {
+    const index = settingsTabs.indexOf(name);
+    let next;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % settingsTabs.length;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index + settingsTabs.length - 1) % settingsTabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = settingsTabs.length - 1;
+    else return;
+    event.preventDefault();
+    void selectSettingsTab(settingsTabs[next], true);
+  });
+}
+
+async function saveSettingsForm(event, name, path, body) {
+  event.preventDefault();
+  const session = settingsSession;
+  const controls = event.currentTarget.querySelectorAll("input, button");
+  const tabs = settingsTabs.map((tab) => $("tab-" + tab));
+  controls.forEach((control) => { control.disabled = true; });
+  tabs.forEach((tab) => { tab.disabled = true; });
+  modelError();
+  settingsStatus();
+  try {
+    await api(path, { method: "PUT", body });
+    if (session === settingsSession && activeSettingsTab === name) settingsStatus("更改已保存。");
     notice();
   } catch (error) {
-    modelError(error.message);
+    if (session === settingsSession && activeSettingsTab === name) modelError(error.message);
   } finally {
-    submit.disabled = false;
+    tabs.forEach((tab) => { tab.disabled = false; });
+    if (session === settingsSession) controls.forEach((control) => { control.disabled = false; });
   }
-});
+}
+
+for (const formId of ["capabilities-form", "memory-settings-form"]) {
+  $(formId).addEventListener("change", () => settingsStatus());
+}
+
+$("capabilities-form").addEventListener("submit", (event) => void saveSettingsForm(event, "capabilities", "/ui/capabilities", {
+  view: $("capability-view").checked,
+  register: $("capability-register").checked,
+  computer_use: $("capability-computer-use").checked,
+}));
+$("memory-settings-form").addEventListener("submit", (event) => void saveSettingsForm(event, "memory", "/ui/memory/settings", {
+  enabled: $("memory-enabled").checked,
+  automatic: $("memory-automatic").checked,
+  personal: $("memory-personal").checked,
+}));
 $("model-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("model-form").querySelector("[type=submit]");
@@ -1636,7 +1714,7 @@ for (const button of actionButtons) {
 
 $("settings").addEventListener("click", () => void openSettings());
 $("close-settings").addEventListener("click", () => $("model-dialog").close());
-$("model-dialog").addEventListener("close", () => { $("api-key").value = ""; });
+$("model-dialog").addEventListener("close", () => { settingsSession++; $("api-key").value = ""; });
 $("menu").addEventListener("click", () => sidebar(!$("sidebar").classList.contains("open")));
 function closeSidebar() {
   sidebar(false);
@@ -1748,3 +1826,10 @@ setInterval(() => {
   const view = turns.get(run.id);
   if (view) void loadTrace(view, run.id);
 }, 350);
+
+setInterval(() => {
+  if (document.hidden) return;
+  for (const [id, view] of turns) {
+    if (view.skillReviewPending) void loadTrace(view, id, true);
+  }
+}, 3000);

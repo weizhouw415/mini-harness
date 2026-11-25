@@ -42,6 +42,9 @@ def main(*, headless: bool = False):
 
     desktop = not headless and sys.platform in {"darwin", "win32"}
     worker_env = env.copy()
+    worker_env["MINI_WORKER_SKILLS_DIR"] = str(Path(
+        env.get("HARNESS_SKILLS_DIR") or Path(env.get("HARNESS_DATA_DIR", ".harness")) / "skills"
+    ).expanduser().resolve())
     worker_env["MINI_WORKER_SECRET"] = worker_env.pop("HARNESS_WORKER_SECRET")
     worker_env.pop("HARNESS_API_TOKEN", None)
     browser_env = worker_env.copy()

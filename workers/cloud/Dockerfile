@@ -15,7 +15,8 @@ RUN --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
     && apt-get install -y --no-install-recommends chromium-headless-shell fonts-liberation poppler-utils librsvg2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --no-index --find-links=/wheels 'mini-harness[cloud]' \
-    && useradd --create-home --uid 10001 worker
+    && useradd --create-home --uid 10001 worker \
+    && install -d -m 0700 -o worker -g worker /skills
 
 ENV PYTHONUNBUFFERED=1 \
     MINI_WORKER_WORKSPACE_ROOT=/tmp/mini-harness-worker \

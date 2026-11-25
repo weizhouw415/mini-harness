@@ -3,7 +3,6 @@ import unittest
 import os
 from itertools import product
 from pathlib import Path
-from unittest.mock import Mock
 
 import httpx
 
@@ -48,13 +47,10 @@ class CapabilityPromptTest(unittest.TestCase):
         worker = {"environment": "cloud-browser", "bash": True, "artifact_workspace": True,
                   "computer": True, "computer_cli": True, "actions": ["screenshot"],
                   "computer_targets": {"browser": ["screenshot"]}, "cli_capability_toggles": True}
-        skills = Mock()
-        skills.index.return_value = []
-        skills.match.return_value = []
         for view, register, computer in product((False, True), repeat=3):
             enabled = {"view": view, "register": register, "computer_use": computer}
             with self.subTest(enabled=enabled):
-                prompt = build_messages({"task": "test"}, worker, skills, [], [], Path.cwd(), 10_000,
+                prompt = build_messages({"task": "test"}, worker, [], [], [], Path.cwd(), 10_000,
                                         cli_capabilities=enabled)[0]["content"]
                 tools = build_tools(enabled)
                 self.assertEqual([entry["function"]["name"] for entry in tools], ["bash"])
@@ -72,24 +68,21 @@ class CapabilityPromptTest(unittest.TestCase):
 
     def test_disabled_commands_are_not_reintroduced_by_dynamic_system_context(self):
         worker = {"environment": "cloud-browser", "bash": True, "artifact_workspace": True}
-        skills = Mock()
-        skills.index.return_value = [
-            {"name": "visual", "state": "active", "description": "Use harness view to inspect"},
-            {"name": "data", "state": "active", "description": "Process CSV"},
+        profiles = [
+            {"name": "visual", "description": "Use harness view to inspect", "path": "/skills/visual/SKILL.md"},
+            {"name": "data", "description": "Validate the CSV row count.", "path": "/skills/data/SKILL.md"},
         ]
-        skills.match.return_value = [{"content": "Run harness computer screenshot"},
-                                     {"content": "Validate the CSV row count."}]
         events = [
             {"type": "assistant", "data": {"message": {"role": "assistant", "content": ""},
                                              "calls": [{"call_id": "1", "provider_id": "p1"}]}},
             {"type": "tool_result", "data": {"call_id": "1", "result": {
                 "error": "harness register failed", "path": "harness view results.txt"}}},
         ]
-        prompt = build_messages({"task": "test"}, worker, skills, [], events, Path.cwd(), 10_000,
+        prompt = build_messages({"task": "test"}, worker, profiles, [], events, Path.cwd(), 10_000,
                                 cli_capabilities={name: False for name in ALL_ON})[0]["content"]
         for command in ("harness view", "harness register", "harness computer"):
             self.assertNotIn(command, prompt)
-        self.assertIn("Process CSV", prompt)
+        self.assertIn("/skills/data/SKILL.md", prompt)
         self.assertIn("Validate the CSV row count", prompt)
 
 

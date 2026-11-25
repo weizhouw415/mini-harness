@@ -7,15 +7,32 @@ from harness.core.context import build_messages
 from harness.storage.sqlite import RunStore
 
 
-class EmptySkills:
-    def index(self, environment):
-        return []
-
-    def match(self, task, environment):
-        return []
-
-
 class SessionHistoryTest(unittest.TestCase):
+    def test_reasoning_is_excluded_from_previous_and_current_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory))
+            first = store.create("first", None, None)
+            original = {"message": {"role": "assistant", "content": "answer",
+                                    "reasoning_content": "private previous reasoning"}, "calls": []}
+            store.event(first["id"], "assistant", original)
+            store.transition(first["id"], {"queued"}, "completed", output="answer")
+            current = store.create("next", first["session_id"], None)
+            previous = store.previous(first["session_id"], current["id"])
+            call = {"call_id": "c1", "provider_id": "p1", "name": "bash", "arguments": "{}"}
+            events = [
+                {"type": "assistant", "data": {"message": {"role": "assistant", "content": None,
+                 "reasoning_content": "private current reasoning", "tool_calls": []}, "calls": [call]}},
+                {"type": "tool_result", "data": {"call_id": "c1", "result": {"stdout": "ok"}}},
+            ]
+            messages = build_messages(current, {}, [], previous, events, Path(directory), 1000)
+            serialized = json.dumps(messages)
+            self.assertNotIn("reasoning_content", serialized)
+            self.assertNotIn("private previous reasoning", serialized)
+            self.assertNotIn("private current reasoning", serialized)
+            self.assertEqual(previous[0]["events"][0]["data"]["message"]["reasoning_content"],
+                             "private previous reasoning")
+            self.assertEqual(events[0]["data"]["message"]["reasoning_content"], "private current reasoning")
+
     def test_failed_cancelled_and_completed_runs_include_full_events(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(Path(directory))
@@ -30,7 +47,7 @@ class SessionHistoryTest(unittest.TestCase):
             store.transition(third["id"], {"queued"}, "cancelled")
             current = store.create("continue", first["session_id"], None)
             previous = store.previous(first["session_id"], current["id"])
-            messages = build_messages(current, {}, EmptySkills(), previous, [], Path(directory), 1000)
+            messages = build_messages(current, {}, [], previous, [], Path(directory), 1000)
             self.assertEqual([run["status"] for run in previous], ["completed", "failed", "cancelled"])
             self.assertIn(detail, messages[5]["content"])
             record = json.loads(messages[5]["content"].split("\n", 1)[1])
@@ -52,5 +69,5 @@ class SessionHistoryTest(unittest.TestCase):
                 }, "calls": [call]}},
                 {"type": "tool_result", "data": {"call_id": "c1", "result": {"stdout": text}}},
             ]
-            messages = build_messages({"task": "test"}, {}, EmptySkills(), [], events, Path(directory), 1000)
+            messages = build_messages({"task": "test"}, {}, [], [], events, Path(directory), 1000)
             self.assertEqual(json.loads(messages[-1]["content"])["stdout"], text)

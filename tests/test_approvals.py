@@ -243,12 +243,12 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         ], pauses=(1, 2, 3), automatic=(0,))
 
     def test_tool_arguments_validate_gesture_fields_and_keep_the_reviewed_timeout(self):
-        agent = Agent(Settings(), None, None, None, None)
+        agent = Agent(Settings(), None, None, None)
         bash = {"name": "bash", "arguments": '{"command": "pwd"}'}
         self.assertEqual(agent._arguments(bash), {"command": "pwd", "timeout": 120})
         old_request = {"arguments": {"command": "pwd", "timeout": 30}}
         self.assertEqual(agent._arguments(bash, old_request), old_request["arguments"])
-        capped_agent = Agent(Settings(max_tool_seconds=60), None, None, None, None)
+        capped_agent = Agent(Settings(max_tool_seconds=60), None, None, None)
         self.assertEqual(capped_agent._arguments(bash)["timeout"], 60)
 
         invalid_actions = [

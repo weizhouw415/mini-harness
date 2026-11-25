@@ -53,6 +53,9 @@ class WorkerConnection:
     pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    skill_profiles: list[dict[str, str]] = field(default_factory=list)
+    skill_directory: str = ""
+
     async def request(
         self, call_id: str, method: str, params: dict[str, Any], timeout: float
     ) -> dict[str, Any]:
@@ -407,12 +410,21 @@ class WorkerManager:
     async def _prepare(
         self, worker: WorkerConnection, method: str, run_id: str, workspace_id: str
     ) -> None:
-        await worker.request(
+        metadata = await worker.request(
             secrets.token_hex(16),
             method,
             {"run_id": run_id, "workspace_id": workspace_id},
             60,
         )
+        profiles = metadata.get("skill_profiles")
+        worker.skill_profiles = [
+            {key: profile[key] for key in ("name", "description", "path")}
+            for profile in profiles[:32]
+            if isinstance(profile, dict) and all(isinstance(profile.get(key), str) and len(profile[key]) <= 4096
+                                                 for key in ("name", "description", "path"))
+        ] if isinstance(profiles, list) else []
+        directory = metadata.get("skill_directory")
+        worker.skill_directory = directory if isinstance(directory, str) and len(directory) <= 4096 else ""
 
     @staticmethod
     def _validate_run(run_id: str, workspace_id: str) -> None:
@@ -453,16 +465,6 @@ class WorkerManager:
         return await self._get_worker(worker_id, run_id).request(
             call_id, "computer.cli", {"run_id": run_id, "action": action, "observe": observe, "output": output},
             timeout,
-        )
-
-    async def prepare_skill_workspace(self, worker_id: str, run_id: str, skills: list[dict]) -> None:
-        await self._get_worker(worker_id, run_id).request(
-            secrets.token_hex(16), "skills.prepare", {"run_id": run_id, "skills": skills}, 15,
-        )
-
-    async def collect_skill_candidates(self, worker_id: str, run_id: str) -> dict:
-        return await self._get_worker(worker_id, run_id).request(
-            secrets.token_hex(16), "skills.collect", {"run_id": run_id}, 15,
         )
 
     async def stage_artifact(self, worker_id: str, run_id: str, path: str, content: bytes) -> None:

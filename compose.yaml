@@ -9,11 +9,13 @@ services:
       HARNESS_MODEL: ${HARNESS_MODEL:?Set HARNESS_MODEL}
       HARNESS_LLM_BASE_URL: ${HARNESS_LLM_BASE_URL:-https://api.openai.com/v1}
       HARNESS_LLM_API_KEY: ${HARNESS_LLM_API_KEY:-}
+      HARNESS_SKILLS_DIR: /skills
       HARNESS_TRUST_CLOUD_BASH: ${HARNESS_TRUST_CLOUD_BASH:-0}
     ports:
       - "127.0.0.1:${HARNESS_PORT:-8000}:8000"
     volumes:
       - data:/data
+      - skills:/skills
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -30,9 +32,12 @@ services:
       MINI_WORKER_URL: ws://server:8000/v1/workers/ws
       MINI_WORKER_ALLOW_INSECURE: "1"
       MINI_WORKER_ID: cloud
+      MINI_WORKER_SKILLS_DIR: /skills
       MINI_WORKER_SECRET: ${HARNESS_WORKER_SECRET:?Set HARNESS_WORKER_SECRET}
       NO_PROXY: "server,localhost,127.0.0.1,${NO_PROXY:-}"
       no_proxy: "server,localhost,127.0.0.1,${NO_PROXY:-}"
+    volumes:
+      - skills:/skills
     read_only: true
     tmpfs:
       - /tmp:mode=1777
@@ -59,3 +64,4 @@ services:
 
 volumes:
   data:
+  skills:

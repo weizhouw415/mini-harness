@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sqlite3
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -16,9 +15,8 @@ from harness.core.llm import LLM, ModelError
 from harness.core.multimodal import artifact_block, persist_content
 from harness.execution.computer_cli import COMPUTER_HELP, parse_computer_command
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
-from harness.skills.commands import is_skill_command, run_skill_command
-from harness.skills.evolution import review_skills
-from harness.skills.loader import SkillError
+from harness.memory.commands import is_memory_command, run_memory_command
+from harness.memory.working import working_checkpoint
 from harness.storage.sqlite import RunStore
 from workers.common.actions import GUI_ACTIONS, SCROLL_DIRECTIONS, point_fields, scroll_deltas, text_field
 
@@ -30,12 +28,12 @@ ASSISTANT_DELTA_INTERVAL = 0.15
 
 
 class Agent:
-    def __init__(self, settings: Settings, store: RunStore, workers: WorkerManager, skills, llm: LLM, *,
-                 capability_config=None):
-        self.settings, self.store, self.workers, self.skills, self.llm = settings, store, workers, skills, llm
+    def __init__(self, settings: Settings, store: RunStore, workers: WorkerManager, llm: LLM, *,
+                 capability_config=None, memory_store=None, memory_config=None):
+        self.settings, self.store, self.workers, self.llm = settings, store, workers, llm
         self.capability_config = capability_config
+        self.memory_store, self.memory_config = memory_store, memory_config
         self.tasks: dict[str, asyncio.Task] = {}
-        self.skill_reviews: set[asyncio.Task] = set()
 
     def schedule(self, run_id: str):
         current = self.tasks.get(run_id)
@@ -51,7 +49,7 @@ class Agent:
             self.schedule(run_id)
 
     async def stop(self):
-        tasks = [*self.tasks.values(), *self.skill_reviews]
+        tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -79,7 +77,8 @@ class Agent:
                 worker = await self.workers.acquire(
                     run["requested_worker"], run_id, run["workspace_id"], on_reserved=bind,
                 )
-            await self._loop(self.store.get(run_id), worker.capabilities)
+            await self._loop(self.store.get(run_id), worker.capabilities,
+                             getattr(worker, "skill_profiles", ()), getattr(worker, "skill_directory", ""))
         except (WorkerUnavailable, WorkerDisconnected) as error:
             worker_id = worker_id or getattr(error, "worker_id", None)
             self.store.transition(run_id, {"running"}, "paused", worker_id=worker_id, error=str(error))
@@ -100,7 +99,7 @@ class Agent:
                 except (WorkerDisconnected, WorkerCallError, WorkerUnavailable):
                     logger.info("Worker cleanup deferred for run %s", run_id)
 
-    async def _loop(self, run: dict, capabilities: dict):
+    async def _loop(self, run: dict, capabilities: dict, skill_profiles=(), skill_directory=""):
         run_id = run["id"]
         snapshots = [event["data"] for event in self.store.events(run_id, include_deltas=False)
                      if event["type"] == "capability_snapshot"]
@@ -112,56 +111,59 @@ class Agent:
             raise WorkerCallError("This Worker cannot enforce CLI capability settings. Update the Worker and retry.")
         directory = self.store.directory / "artifacts" / run_id
         previous = self.store.previous(run["session_id"], run_id)
+        memory_ids = None
         await self._prepare_uploads(run, capabilities)
-        capabilities = await self._prepare_skill_workspace(run, capabilities)
         while True:
             events = self.store.events(run_id, include_deltas=False)
             turns = [event["data"] for event in events if event["type"] == "assistant"]
             if turns:
                 latest = turns[-1]
                 if not latest["calls"]:
-                    candidate_event = await self._collect_skill_candidates(run, capabilities, events)
                     output = latest["message"]["content"]
-                    self.store.transition(run_id, {"running"}, "completed", output=output, event=candidate_event)
-                    if not (candidate_event and candidate_event[1].get("accepted")):
-                        self._schedule_skill_review(run, capabilities.get("environment"), events, previous, output)
+                    self.store.transition(run_id, {"running"}, "completed", output=output,
+                                          memory_extract=bool(self.memory_config and self.memory_config.values["enabled"]
+                                                              and self.memory_config.values["automatic"]),
+                                          skill_review=sum(1 for event in events if event["type"] == "tool_call") >= 8)
                     return
                 if not await self._deliver(run, capabilities, latest["calls"], events, enabled):
                     return
                 events = self.store.events(run_id, include_deltas=False)
             if len(turns) >= self.settings.max_steps:
                 raise ModelError("Maximum number of model steps reached.")
-            messages = build_messages(run, capabilities, self.skills, previous, events, directory,
+            memories = []
+            checkpoint = None
+            if self.memory_store and self.memory_config and self.memory_config.values["enabled"]:
+                checkpoint = await working_checkpoint(run, events, self.settings.context_chars, self.llm, self.store)
+                personal = self.memory_config.values["personal"]
+                if memory_ids is None:
+                    snapshot = next((event["data"] for event in events if event["type"] == "memory_snapshot"), None)
+                    if snapshot is None:
+                        matches = self.memory_store.search(run["session_id"], run["task"], limit=5,
+                                                           include_global=personal)
+                        profile = [item for item in self.memory_store.search(
+                            run["session_id"], limit=100, include_global=personal)
+                                   if item["kind"] == "preference"][:3]
+                        matches = list({item["id"]: item for item in [*profile, *matches]}.values())[:8]
+                        snapshot = {"ids": [item["id"] for item in matches]}
+                        self.store.event(run_id, "memory_snapshot", snapshot)
+                    memory_ids = snapshot["ids"]
+                for identifier in memory_ids:
+                    try:
+                        item = self.memory_store.get(run["session_id"], identifier, include_global=personal)
+                    except ValueError:
+                        continue
+                    remaining = 4000 - sum(len(value["content"]) for value in memories)
+                    if remaining <= 0:
+                        break
+                    memories.append({"id": item["id"], "memory_key": item["memory_key"],
+                                     "content": item["content"][:remaining]})
+            messages = build_messages(run, capabilities, skill_profiles, previous, events, directory,
                                       self.settings.context_chars,
                                       file_path=lambda identifier: self.store.run_file(run_id, identifier)[1],
-                                      cli_capabilities=enabled)
+                                      cli_capabilities=enabled, memories=memories,
+                                      memory_enabled=bool(self.memory_config and self.memory_config.values["enabled"]),
+                                      working_checkpoint=checkpoint, skill_directory=skill_directory)
             await self._complete_turn(run_id, messages, enabled)
-
-    def _schedule_skill_review(self, run, environment, events, previous, output):
-        interval = self.settings.skill_review_interval
-        if not interval:
-            return
-        iterations = 0
-        for event in reversed(events):
-            if event["type"] == "tool_result" and event["data"]["result"].get("skill_changed"):
-                break
-            if event["type"] == "assistant" and event["data"]["calls"]:
-                iterations += 1
-        if iterations < interval:
-            return
-        trace = {**run, "status": "completed", "output": output, "events": events, "previous": previous}
-        task = asyncio.create_task(self._review_skills(run["id"], trace, environment),
-                                   name=f"skill-review-{run['id']}")
-        self.skill_reviews.add(task)
-        task.add_done_callback(self.skill_reviews.discard)
-
-    async def _review_skills(self, run_id, trace, environment):
-        try:
-            result = await review_skills(self.skills, trace, self.llm.complete, environment=environment)
-        except Exception:
-            logger.exception("Skill review failed for run %s", run_id)
-            result = {"status": "failed", "changes": []}
-        self.store.event(run_id, "skill_review", result)
 
     async def _complete_turn(self, run_id: str, messages: list[dict], cli_capabilities: dict | None = None):
         tools = build_tools(cli_capabilities)
@@ -243,42 +245,6 @@ class Agent:
                     content.append({"type": "text", "text": text})
         self.store.event(run_id, "uploads_ready", {"content": content})
 
-    async def _prepare_skill_workspace(self, run: dict, capabilities: dict) -> dict:
-        if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
-            return capabilities
-        events = self.store.events(run["id"], include_deltas=False)
-        if any(event["type"] == "skill_workspace_ready" for event in events):
-            return capabilities
-        # Only populate the workspace before the model can write to it.
-        if not any(event["type"] == "assistant" for event in events):
-            try:
-                skills = self.skills.workspace_snapshot(capabilities["environment"], run["task"])
-                await self.workers.prepare_skill_workspace(run["worker_id"], run["id"], skills)
-            except (SkillError, WorkerCallError, WorkerUnavailable, OSError, sqlite3.Error) as error:
-                logger.warning("Skill workspace unavailable for run %s (%s)", run["id"], type(error).__name__)
-            else:
-                self.store.event(run["id"], "skill_workspace_ready", {"skills": len(skills)})
-                return capabilities
-        return {**capabilities, "skill_workspace": False}
-
-    async def _collect_skill_candidates(self, run: dict, capabilities: dict, events: list[dict]):
-        if capabilities.get("skill_workspace") is not True or capabilities.get("bash") is not True:
-            return None
-        if not any(event["type"] == "tool_call" and event["data"]["tool"] == "bash"
-                   and not event["data"].get("skill_command") for event in events):
-            return None
-        try:
-            result = await self.workers.collect_skill_candidates(run["worker_id"], run["id"])
-            candidates, rejected = result.get("candidates"), result.get("rejected")
-            if not isinstance(candidates, list) or type(rejected) is not int or rejected < 0:
-                raise WorkerCallError("Invalid skill workspace result")
-            counts = self.skills.import_workspace_candidates(candidates)
-        except (SkillError, WorkerCallError, WorkerUnavailable, OSError, sqlite3.Error) as error:
-            logger.warning("Skill candidates unavailable for run %s (%s)", run["id"], type(error).__name__)
-            return "skill_candidates", {"status": "unavailable"}
-        counts["rejected"] += rejected
-        return ("skill_candidates", counts) if any(counts.values()) else None
-
     def _normalize(self, reply: dict) -> tuple[dict, list[dict]]:
         if not isinstance(reply, dict):
             raise ModelError("Model returned an invalid assistant message.")
@@ -342,9 +308,9 @@ class Agent:
                 self._result(run_id, call, {"error": str(error)})
                 continue
             tool, args = event["tool"], event["arguments"]
-            if event.get("skill_command"):
+            if event.get("memory_command"):
                 self.store.event(run_id, "tool_call", event)
-                result = run_skill_command(args["command"], self.skills, capabilities.get("environment"))
+                result = run_memory_command(args["command"], self.memory_store, self.memory_config, run)
                 self._result(run_id, call, result, tool=tool)
                 continue
             if approvals.get(call_id) is False:
@@ -408,8 +374,8 @@ class Agent:
             # Compatible with native computer calls persisted before the CLI was introduced.
             event["arguments"] = self._route_computer(args, capabilities)
             return event
-        if is_skill_command(args["command"]):
-            event["skill_command"] = True
+        if is_memory_command(args["command"]):
+            event["memory_command"] = True
             return event
         command = parse_computer_command(args["command"])
         if command is None:

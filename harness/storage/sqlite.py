@@ -37,6 +37,11 @@ class RunStore:
         with self.connect() as db:
             db.execute("PRAGMA journal_mode = WAL")
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS skill_review_jobs (
+                    run_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'queued',
+                    lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                    result TEXT, created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, created_at TEXT NOT NULL
                 );
@@ -109,7 +114,7 @@ class RunStore:
 
     def create(self, task: str, session_id: str | None, worker_id: str | None,
                approval_mode: ApprovalMode = "legacy", *, upload_ids: list[str] | None = None,
-               worker_target: str | None = None) -> dict:
+               worker_target: str | None = None, memory_input: str | None = None) -> dict:
         run_id, workspace_id = uuid4().hex, uuid4().hex
         created = now()
         upload_ids = upload_ids or []
@@ -146,6 +151,8 @@ class RunStore:
                 raise Conflict("This session already has an unfinished run.") from error
             db.executemany("UPDATE run_files SET run_id = ? WHERE id = ?",
                            [(run_id, upload_id) for upload_id in upload_ids])
+            if memory_input is not None:
+                db.execute("INSERT INTO memory_inputs(run_id, user_input) VALUES (?, ?)", (run_id, memory_input))
         return self.get(run_id)
 
     def get(self, run_id: str, *, include_files: bool = False) -> dict:
@@ -311,7 +318,8 @@ class RunStore:
 
     def transition(self, run_id: str, source: set[str], status: str, *, worker_id: str | None = None,
                    error: str | None = None, output: str | None = None, approval: dict | None = None,
-                   event: tuple[str, dict] | None = None):
+                   event: tuple[str, dict] | None = None, memory_extract: bool = False,
+                   skill_review: bool = False):
         conditions = ", ".join("?" for _ in source)
         with self.connect() as db:
             changed = db.execute(
@@ -325,6 +333,12 @@ class RunStore:
             if event:
                 self._append(db, run_id, *event)
             self._append(db, run_id, "status", {"status": status, "error": error})
+            if skill_review and status == "completed":
+                db.execute("INSERT OR IGNORE INTO skill_review_jobs(run_id, created_at) VALUES (?, ?)", (run_id, now()))
+                self._append(db, run_id, "skill_review", {"status": "queued"})
+            if memory_extract and status == "completed":
+                from harness.memory.jobs import MemoryJobs
+                MemoryJobs.enqueue_extract(db, run_id)
 
     def update_approval_mode(self, run_id: str, mode: ApprovalMode) -> tuple[dict, bool]:
         requeued = False

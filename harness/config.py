@@ -20,7 +20,10 @@ class Settings:
     max_steps: int = 500
     context_chars: int = 48_000
     max_tool_seconds: int = 120
-    skill_review_interval: int = 10
+
+    @property
+    def skills_dir(self) -> Path:
+        return Path(os.environ.get("HARNESS_SKILLS_DIR") or self.data_dir / "skills").expanduser().resolve()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -45,7 +48,6 @@ class Settings:
             max_steps=int(os.environ.get("HARNESS_MAX_STEPS", "500")),
             context_chars=int(os.environ.get("HARNESS_CONTEXT_CHARS", "48000")),
             max_tool_seconds=int(os.environ.get("HARNESS_MAX_TOOL_SECONDS", "120")),
-            skill_review_interval=int(os.environ.get("HARNESS_SKILL_REVIEW_INTERVAL", "10")),
         )
 
 
@@ -161,6 +163,42 @@ class CapabilityConfig:
             raise ValueError("Invalid capability configuration")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
                                          prefix=".capabilities-", delete=False) as file:
+            path = Path(file.name)
+            try:
+                json.dump(values, file, ensure_ascii=False)
+                file.close()
+                path.replace(self.path)
+            finally:
+                path.unlink(missing_ok=True)
+        self._values = values.copy()
+
+
+class MemoryConfig:
+    """Persist the memory feature and its scope for this installation."""
+
+    DEFAULTS = {"enabled": False, "automatic": True, "personal": False}
+
+    def __init__(self, settings: Settings):
+        self.path = settings.data_dir / "memory-settings.json"
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            stored = {}
+        if not isinstance(stored, dict) or any(
+            key in stored and type(stored[key]) is not bool for key in self.DEFAULTS
+        ):
+            raise ValueError("Invalid memory configuration")
+        self._values = {key: stored.get(key, default) for key, default in self.DEFAULTS.items()}
+
+    @property
+    def values(self) -> dict[str, bool]:
+        return self._values.copy()
+
+    def save(self, values: dict[str, bool]) -> None:
+        if set(values) != set(self.DEFAULTS) or any(type(value) is not bool for value in values.values()):
+            raise ValueError("Invalid memory configuration")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                         prefix=".memory-settings-", delete=False) as file:
             path = Path(file.name)
             try:
                 json.dump(values, file, ensure_ascii=False)
