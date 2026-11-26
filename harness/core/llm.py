@@ -20,6 +20,10 @@ class ModelError(RuntimeError):
     pass
 
 
+class TransientModelError(ModelError):
+    """A model response was interrupted and may be retried safely."""
+
+
 DeltaHandler = Callable[[dict[str, str]], None]
 _REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
 _TOOL_FINISH = {"tool_calls", "function_call"}
@@ -159,9 +163,9 @@ class _StreamedReply:
 
     def result(self, done: bool) -> dict:
         if not self.saw_choice or not done and self.finish is None:
-            raise ModelError("Model stream ended before the response completed.")
+            raise TransientModelError("Model stream ended before the response completed.")
         if self.calls and self.finish is None or self.finish in _TOOL_FINISH and not self.calls:
-            raise ModelError("Model stream ended before the tool calls completed.")
+            raise TransientModelError("Model stream ended before the tool calls completed.")
         message = {"role": "assistant", "content": "".join(self.content) or None, "_usage": self.usage}
         if self.reasoning:
             message["reasoning_content"] = "".join(self.reasoning)
@@ -196,7 +200,7 @@ async def _sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]
         elif name == "event":
             event = value
     if data:
-        raise ModelError("Model stream ended inside an event.")
+        raise TransientModelError("Model stream ended inside an event.")
 
 
 async def _sse_reply(response: httpx.Response, on_delta: DeltaHandler | None) -> dict:
@@ -300,6 +304,6 @@ class OpenAICompatible:
                             result["_compatibility"] = {"reasoning_effort": "none"}
                         return result
         except httpx.RequestError as error:
-            raise ModelError(f"Model request failed ({type(error).__name__}).") from error
+            raise TransientModelError(f"Model request failed ({type(error).__name__}).") from error
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ModelError("Model response did not contain a valid assistant message.") from error

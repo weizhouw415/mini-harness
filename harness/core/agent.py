@@ -11,7 +11,7 @@ from harness.artifacts.preview import preview
 from harness.config import Settings
 from harness.core.approval import ApprovalDecision, decide_approval
 from harness.core.context import DEFAULT_BASH_TIMEOUT, build_messages, build_tools
-from harness.core.llm import LLM, ModelError
+from harness.core.llm import LLM, ModelError, TransientModelError
 from harness.core.multimodal import artifact_block, persist_content
 from harness.execution.computer_cli import COMPUTER_HELP, parse_computer_command
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerUnavailable
@@ -177,38 +177,49 @@ class Agent:
         if stream_complete is None:
             reply = await self.llm.complete(messages, tools)
         else:
-            generation = {"generation_id": uuid4().hex}
-            loop = asyncio.get_running_loop()
-            buffered: dict[str, list[str]] = {}
-            last_flush = float("-inf")
-            scheduled: asyncio.TimerHandle | None = None
+            for attempt in range(3):
+                generation = {"generation_id": uuid4().hex}
+                loop = asyncio.get_running_loop()
+                buffered: dict[str, list[str]] = {}
+                last_flush = float("-inf")
+                scheduled: asyncio.TimerHandle | None = None
 
-            def flush():
-                nonlocal last_flush, scheduled
-                scheduled = None
-                if buffered:
-                    delta = {key: "".join(parts) for key, parts in buffered.items()}
-                    self.store.event(run_id, "assistant_delta", {**generation, **delta})
-                    buffered.clear()
-                    last_flush = loop.time()
+                def flush():
+                    nonlocal last_flush, scheduled
+                    scheduled = None
+                    if buffered:
+                        delta = {key: "".join(parts) for key, parts in buffered.items()}
+                        self.store.event(run_id, "assistant_delta", {**generation, **delta})
+                        buffered.clear()
+                        last_flush = loop.time()
 
-            def on_delta(delta: dict[str, str]):
-                nonlocal scheduled
-                for key, text in delta.items():
-                    buffered.setdefault(key, []).append(text)
-                if scheduled is None:
-                    delay = last_flush + ASSISTANT_DELTA_INTERVAL - loop.time()
-                    if delay <= 0:
-                        flush()
-                    else:
-                        scheduled = loop.call_later(delay, flush)
+                def on_delta(delta: dict[str, str]):
+                    nonlocal scheduled
+                    for key, text in delta.items():
+                        buffered.setdefault(key, []).append(text)
+                    if scheduled is None:
+                        delay = last_flush + ASSISTANT_DELTA_INTERVAL - loop.time()
+                        if delay <= 0:
+                            flush()
+                        else:
+                            scheduled = loop.call_later(delay, flush)
 
-            try:
-                reply = await stream_complete(messages, tools, on_delta=on_delta)
-            finally:
-                if scheduled is not None:
-                    scheduled.cancel()
-                flush()
+                try:
+                    reply = await stream_complete(messages, tools, on_delta=on_delta)
+                except TransientModelError:
+                    if attempt == 2:
+                        raise
+                    if scheduled is not None:
+                        scheduled.cancel()
+                    flush()
+                    self.store.event(run_id, "model_retry", {"attempt": attempt + 1})
+                else:
+                    break
+                finally:
+                    if scheduled is not None:
+                        scheduled.cancel()
+                    flush()
+                await asyncio.sleep(2 ** attempt)
         if reply.get("_compatibility") == {"reasoning_effort": "none"} and not any(
             event["type"] == "model_compatibility" and event["data"].get("reasoning_effort") == "none"
             for event in self.store.events(run_id, include_deltas=False)

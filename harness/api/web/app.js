@@ -978,6 +978,11 @@ function appendEvents(view, events, id) {
       view.skillReview.textContent = (labels[data.status] || "技能复盘") + (data.name ? "：" + data.name : "") + (data.reason ? " · " + data.reason : "");
     } else if (type === "worker_bound") {
       addTraceEntry(view, "screen", "已连接 Worker", data.worker_id, event.created_at);
+    } else if (type === "model_retry") {
+      view.generation?.reasoningRow?.entry.remove();
+      view.generation?.update?.entry.remove();
+      view.generation = null;
+      addTraceEntry(view, "activity", "模型连接中断，正在重试", `第 ${data.attempt} 次重试`, event.created_at);
     } else if (type === "model_compatibility" && data.reasoning_effort === "none") {
       addTraceEntry(view, "activity", "模型兼容模式", "该模型通过 Chat Completions 调用工具时已自动关闭推理。", event.created_at);
     } else if (data.call_id && traceCallEvents.has(type)) {
