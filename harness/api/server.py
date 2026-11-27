@@ -12,10 +12,15 @@ from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOADS, file_name
+from harness.channels.feishu import FeishuService, FeishuSettings, MAX_TASK_LENGTH
+from harness.channels.feishu_registration import FeishuRegistration
+from harness.channels.feishu_transport import FeishuTransport
 from harness.config import CapabilityConfig, MemoryConfig, ModelConfig, Settings
 from harness.core.agent import Agent
 from harness.core.llm import ModelError, OpenAICompatible
@@ -28,7 +33,7 @@ from harness.skills.jobs import SkillReviewJobs
 
 
 class RunRequest(BaseModel):
-    task: str = Field(default="", max_length=16_000)
+    task: str = Field(default="", max_length=MAX_TASK_LENGTH)
     session_id: str | None = None
     worker_id: str | None = None
     worker_target: WorkerTarget | None = None
@@ -96,7 +101,7 @@ class ChatRequest(BaseModel):
 
 
 def create_app(settings: Settings | None = None, *, llm=None, worker_manager=None,
-               local_ui=False) -> FastAPI:
+               local_ui=False, feishu_transport_factory=FeishuTransport) -> FastAPI:
     settings = settings or Settings.from_env()
     if not settings.api_token:
         raise ValueError("Set HARNESS_API_TOKEN to protect the API.")
@@ -129,14 +134,57 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     memory_jobs = MemoryJobs(store, memory_store, llm, memory_config)
     skill_jobs = SkillReviewJobs(store, llm, settings.skills_dir)
 
+    def start(task: str, session_id: str | None, worker_id: str | None,
+              approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy",
+              upload_ids: list[str] | None = None, *, worker_target: WorkerTarget | None = None,
+              memory_input: str | None = None, run_id: str | None = None):
+        if upload_ids and not task.strip():
+            task = "请查看我上传的附件。"
+        if not task.strip() or len(task) > MAX_TASK_LENGTH:
+            raise HTTPException(422, f"The task must contain 1 to {MAX_TASK_LENGTH} characters.")
+        if worker_id is not None and worker_target is not None:
+            raise HTTPException(422, "Specify either worker_id or worker_target.")
+        run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids,
+                           worker_target=worker_target, memory_input=memory_input if memory_input is not None else task,
+                           run_id=run_id)
+        agent.schedule(run["id"])
+        return store.get(run["id"], include_files=True)
+
+    def start_feishu(task: str, session_id: str | None, run_id: str, mode: Literal["manual", "allow"]):
+        return start(task, session_id, None, mode, worker_target="browser", run_id=run_id)
+
+    def decide_approval(run_id: str, request: ApprovalRequest):
+        run = store.get(run_id)
+        if run["status"] != "awaiting_approval" or run["approval"]["call_id"] != request.call_id:
+            raise Conflict("This call is not awaiting approval.")
+        store.transition(run_id, {"awaiting_approval"}, "queued",
+                         event=("approval_decision", request.model_dump()))
+        agent.schedule(run_id)
+        return store.get(run_id)
+
+    def decide_feishu(run_id: str, call_id: str, approved: bool, *, scope: str):
+        if scope == "once":
+            decide_approval(run_id, ApprovalRequest(call_id=call_id, approved=approved))
+            return
+        _, requeued = store.update_approval_mode(run_id, "allow", expected_call_id=call_id,
+                                                allow_feishu_session=scope == "session")
+        if requeued:
+            agent.schedule(run_id)
+
+    feishu = FeishuService(store, start_feishu, feishu_transport_factory, decide_feishu)
+    feishu_registration = FeishuRegistration(feishu)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.recover_interrupted()
         memory_jobs.start()
         skill_jobs.start()
+        feishu.start()
         try:
             yield
         finally:
+            await feishu_registration.stop()
+            await feishu.stop()
             await skill_jobs.stop()
             await memory_jobs.stop()
             await agent.stop()
@@ -185,6 +233,13 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     async def model_error(_, error):
         return JSONResponse({"detail": str(error)}, 502)
 
+    @app.exception_handler(RequestValidationError)
+    async def validate_request(request: Request, error: RequestValidationError):
+        if request.url.path.rstrip("/") == "/v1/settings/feishu":
+            # Validation errors can otherwise echo the credential or the request body.
+            return JSONResponse({"detail": "飞书配置格式有误，请检查 App ID、App Secret 和用户 Open ID。"}, 422)
+        return await request_validation_exception_handler(request, error)
+
     @app.get("/health")
     async def health():
         return {"status": "ok"}
@@ -232,6 +287,31 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     def require_local_model_access(request: Request):
         if not is_local_ui(request):
             raise HTTPException(403, "Open the Web UI on the local server's loopback address.")
+
+    @app.get("/v1/settings/feishu", dependencies=control)
+    async def read_feishu_settings():
+        return JSONResponse(feishu.status(), headers={"Cache-Control": "no-store"})
+
+    @app.put("/v1/settings/feishu", dependencies=control)
+    async def write_feishu_settings(config: FeishuSettings):
+        try:
+            await feishu.save(config)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return JSONResponse(feishu.status(), headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/settings/feishu/registration", dependencies=control, status_code=202)
+    async def start_feishu_registration():
+        return JSONResponse(feishu_registration.start(), status_code=202, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/settings/feishu/registration/{registration_id}", dependencies=control)
+    async def read_feishu_registration(registration_id: str):
+        return JSONResponse(feishu_registration.status(registration_id), headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/settings/feishu/registration/{registration_id}", dependencies=control, status_code=204)
+    async def cancel_feishu_registration(registration_id: str):
+        await feishu_registration.cancel(registration_id)
+        return Response(status_code=204)
 
     @app.get("/ui/memory/settings", include_in_schema=False)
     async def read_memory_settings(request: Request):
@@ -392,21 +472,6 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
             content.extend(chunk)
         return await asyncio.to_thread(store.add_upload, name, bytes(content))
 
-    def start(task: str, session_id: str | None, worker_id: str | None,
-              approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy",
-              upload_ids: list[str] | None = None, *, worker_target: WorkerTarget | None = None,
-              memory_input: str | None = None):
-        if upload_ids and not task.strip():
-            task = "请查看我上传的附件。"
-        if not task.strip() or len(task) > 16_000:
-            raise HTTPException(422, "The task must contain 1 to 16000 characters.")
-        if worker_id is not None and worker_target is not None:
-            raise HTTPException(422, "Specify either worker_id or worker_target.")
-        run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids,
-                           worker_target=worker_target, memory_input=memory_input if memory_input is not None else task)
-        agent.schedule(run["id"])
-        return store.get(run["id"], include_files=True)
-
     @app.post("/v1/runs", status_code=202, dependencies=control)
     async def start_run(request: RunRequest):
         return start(request.task, request.session_id, request.worker_id, request.approval_mode or "legacy",
@@ -465,13 +530,7 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
 
     @app.post("/v1/runs/{run_id}/approve", status_code=202, dependencies=control)
     async def decide(run_id: str, request: ApprovalRequest):
-        run = store.get(run_id)
-        if run["status"] != "awaiting_approval" or run["approval"]["call_id"] != request.call_id:
-            raise Conflict("This call is not awaiting approval.")
-        store.transition(run_id, {"awaiting_approval"}, "queued",
-                         event=("approval_decision", request.model_dump()))
-        agent.schedule(run_id)
-        return store.get(run_id)
+        return decide_approval(run_id, request)
 
     @app.patch("/v1/runs/{run_id}/approval-mode", dependencies=control)
     async def change_approval_mode(run_id: str, request: ApprovalModeRequest):

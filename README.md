@@ -51,6 +51,26 @@ Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromi
 
 也可以单独运行 `mini-harness serve` 和 `python -m workers.cloud` 来开发与测试。先安装 `python -m pip install -e '.[cloud]'`，再运行 `python -m playwright install chromium`。为每个浏览器 Worker 设置不同的 `MINI_WORKER_ID`，即可增加并行容量。开发用 Worker 进程会以当前账号运行，其 Bash 拥有该账号的权限。
 
+## 接入飞书 IM
+
+Docker 服务端镜像包含飞书依赖。使用本地 Python 安装时，在服务端环境运行 `python -m pip install -e '.[feishu]'` 并重启服务。飞书只需要服务端能够访问飞书开放平台，无需公开本地 API。
+
+在「设置 → 飞书 IM」点击「生成二维码」，用手机飞书扫一扫并确认创建。Mini Harness 会自动保存机器人凭证、启用连接，并仅将扫码账号加入允许名单。确认后，在手机飞书打开机器人并发送单聊消息。如企业要求审批，按飞书页面提示完成审批后再测试消息。已有机器人可以展开「手动配置已有机器人」。 [飞书官方扫码注册说明](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/README.zh.md#一键创建应用)
+
+手动配置步骤如下。
+
+1. 在飞书开放平台创建企业自建应用，添加机器人能力，开通「获取用户发给机器人的单聊消息」和「以应用的身份发消息」权限。通过该应用的身份获取允许使用机器人的用户 Open ID。 [机器人指南](https://open.feishu.cn/document/client-docs/bot-v3/how-to-use-bot-in-feishu) · [Open ID 说明](https://open.feishu.cn/document/home/user-identity-introduction/open-id)
+2. 在 Mini Harness 本地 Web UI 中打开「设置 → 飞书 IM」，填写 App ID、App Secret 和允许的用户 Open ID，启用并保存。等待页面显示已连接。使用 API Token 管理的服务也可调用 `PUT /v1/settings/feishu`。飞书会在保存长连接配置时检查客户端是否在线。 [长连接说明](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
+3. 在飞书应用的「事件与回调」中选择长连接，添加「接收消息」事件 `im.message.receive_v1` 和「卡片回传交互」回调 `card.action.trigger`。开通「发送、删除消息表情回复」权限 `im:message.reactions:write_only`，发布应用版本并确认白名单用户在应用可用范围内。已有机器人也可按这一步补充回调和表情权限。 [卡片交互配置](https://open.feishu.cn/document/feishu-cards/configuring-card-interactions) · [消息表情 API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1#emoji-reply)
+
+同一个用户的消息会在独立会话里依次处理。收到任务后，机器人在原消息上添加「正在输入」表情，发完最终回复后移除。工具步骤按批次回复到原消息，最终回复使用飞书 Markdown 卡片。审批默认使用飞书卡片内的指令。`/approve <审批码>` 同意本次，`/approve-session <审批码>` 允许本会话当前任务及后续任务的工具操作，`/deny <审批码>` 拒绝本次。`/approval manual` 撤销本会话对新任务的授权。
+
+飞书长连接收到消息后，审批指令即可使用。希望使用按钮时，在飞书侧确认 `card.action.trigger` 长连接回调已配置并发布，然后在 Mini Harness 飞书 IM 设置中勾选「使用审批按钮」。如果飞书开发后台无法打开扫码创建的应用，仍可直接在对话里使用审批指令。飞书 IM 设置中的「完全允许」会为所有白名单用户跳过工具审批，并放行正在等待审批的飞书任务。恢复「逐次审批」后，新任务恢复默认策略，此前单独授权的会话可用 `/approval manual` 撤销。
+
+任务使用浏览器 Worker。任务暂停时可在 Mini Harness 网页中恢复或取消。禁用连接会停止从飞书接收和回复，已创建的任务仍可在网页中操作。重新启用同一个应用后，网关继续处理已接收的消息。
+
+首版支持单聊文本。把飞书白名单限定在信任此 Harness 实例的用户内。个人跨会话记忆开启后，同一实例中的不同会话可能访问全局记忆。
+
 ## 连接本地桌面
 
 在要操作的桌面上安装 `python -m pip install -e '.[desktop]'`，设置下列变量，再运行 `python -m workers.desktop`。

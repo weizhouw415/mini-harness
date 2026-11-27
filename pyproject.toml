@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 cloud = ["playwright==1.62.0"]
 desktop = ["PyAutoGUI>=0.9.54,<1", "playwright==1.62.0"]
+feishu = ["lark-channel-sdk==1.4.0", "lark-oapi==1.9.0", "qrcode>=8,<9"]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2"]
 
 [project.scripts]

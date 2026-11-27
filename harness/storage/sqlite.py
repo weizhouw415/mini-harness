@@ -54,6 +54,9 @@ class RunStore:
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS feishu_session_approvals (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(id)
+                );
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -123,8 +126,9 @@ class RunStore:
 
     def create(self, task: str, session_id: str | None, worker_id: str | None,
                approval_mode: ApprovalMode = "legacy", *, upload_ids: list[str] | None = None,
-               worker_target: str | None = None, memory_input: str | None = None) -> dict:
-        run_id, workspace_id = uuid4().hex, uuid4().hex
+               worker_target: str | None = None, memory_input: str | None = None,
+               run_id: str | None = None) -> dict:
+        run_id, workspace_id = run_id or uuid4().hex, uuid4().hex
         created = now()
         upload_ids = upload_ids or []
         with self.connect() as db:
@@ -378,15 +382,32 @@ class RunStore:
         ).fetchone()[0]
         return iterations >= _SKILL_REVIEW_INTERVAL
 
-    def update_approval_mode(self, run_id: str, mode: ApprovalMode) -> tuple[dict, bool]:
+    def feishu_session_allowed(self, session_id: str) -> bool:
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM feishu_session_approvals WHERE session_id = ?",
+                              (session_id,)).fetchone() is not None
+
+    def revoke_feishu_session_approval(self, session_id: str):
+        with self.connect() as db:
+            db.execute("DELETE FROM feishu_session_approvals WHERE session_id = ?", (session_id,))
+
+    def update_approval_mode(self, run_id: str, mode: ApprovalMode, *, expected_call_id: str | None = None,
+                             allow_feishu_session: bool = False) -> tuple[dict, bool]:
         requeued = False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status, approval_mode, approval FROM runs WHERE id = ?", (run_id,)).fetchone()
+            row = db.execute("SELECT status, approval_mode, approval, session_id FROM runs WHERE id = ?",
+                             (run_id,)).fetchone()
             if row is None:
                 raise NotFound("Run not found.")
             if row["status"] not in {"queued", "running", "paused", "awaiting_approval"}:
                 raise Conflict("Approval mode can only be changed on an unfinished run.")
+            if expected_call_id is not None and (
+                row["status"] != "awaiting_approval" or json.loads(row["approval"])["call_id"] != expected_call_id
+            ):
+                raise Conflict("This call is not awaiting approval.")
+            if allow_feishu_session:
+                db.execute("INSERT OR IGNORE INTO feishu_session_approvals VALUES (?)", (row["session_id"],))
             if row["approval_mode"] != mode:
                 requeued = row["status"] == "awaiting_approval"
                 db.execute(

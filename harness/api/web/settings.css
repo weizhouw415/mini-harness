@@ -222,3 +222,30 @@
 .settings-note { margin: -4px 0 16px; padding: 10px 12px; border-radius: 8px; background: var(--canvas); color: var(--muted); font-size: 12px; line-height: 1.6; }
 #settings-status { margin: 16px 0 0; color: var(--success); font-size: 13px; }
 @media (max-width: 600px) { .settings-tab small { display: none; } }
+@media (max-width: 460px) { .settings-tab-icon { display: none; } }
+
+#model-dialog #feishu-settings-form .capability-option { margin: 0 0 16px; }
+.feishu-status {
+  flex: none;
+  padding: 4px 9px;
+  border-radius: 99px;
+  background: var(--canvas);
+  color: var(--muted);
+  font-size: 12px;
+}
+.feishu-status[data-state="connected"] { color: var(--success); }
+.feishu-status[data-state="error"], .feishu-error { color: var(--danger); }
+.feishu-error { margin: -8px 0 16px; font-size: 13px; overflow-wrap: anywhere; }
+.settings-note a, .settings-field-hint a { color: var(--accent); }
+.settings-field-hint { margin: -8px 0 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.feishu-clear-secret { display: block; margin-bottom: 14px; }
+#feishu-open-ids { resize: vertical; }
+.feishu-scan { margin-bottom: 20px; }
+.feishu-scan p { color: var(--muted); margin: 0 0 12px; }
+.feishu-scan-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+#feishu-scan-code { display: block; max-width: 100%; height: auto; border-radius: 8px; }
+#feishu-scan-code[hidden] { display: none; }
+#feishu-scan-link { color: var(--accent); }
+#feishu-settings-form { margin-top: 16px; }
+#feishu-approval-mode { width: 100%; margin: 0 0 16px; }
+#feishu-settings-form summary { margin-bottom: 14px; cursor: pointer; }
