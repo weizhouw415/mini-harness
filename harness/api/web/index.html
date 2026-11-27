@@ -172,6 +172,9 @@
         <button id="tab-memory" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-memory" tabindex="-1">
           <span class="settings-tab-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M12 20V4m0 2a3 3 0 0 0-5-1 3 3 0 0 0-2 5 3.5 3.5 0 0 0 1 6 3 3 0 0 0 6 2m0-12a3 3 0 0 1 5-1 3 3 0 0 1 2 5 3.5 3.5 0 0 1-1 6 3 3 0 0 1-6 2"/></svg></span><span>记忆<small>记忆与个性化</small></span>
         </button>
+        <button id="tab-feishu" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-feishu" tabindex="-1">
+          <span class="settings-tab-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.7-3.4A7.5 7.5 0 1 1 20 11.5Z"/><path d="M9 11.5h7"/></svg></span><span>飞书 IM<small>机器人连接</small></span>
+        </button>
       </nav>
       <div class="settings-content">
         <section id="panel-providers" class="settings-panel" role="tabpanel" aria-labelledby="tab-providers">
@@ -212,6 +215,47 @@
             <label class="capability-option" for="memory-enabled"><span><strong>启用记忆</strong><small>在任务中使用和管理保存的记忆。</small></span><input id="memory-enabled" type="checkbox" role="switch"></label>
             <label class="capability-option" for="memory-automatic"><span><strong>自动提取记忆</strong><small>任务完成后，从用户输入中提取有长期价值的信息。</small></span><input id="memory-automatic" type="checkbox" role="switch"></label>
             <label class="capability-option" for="memory-personal"><span><strong>个人跨会话记忆</strong><small>允许此实例的不同会话使用共同的个人记忆。</small></span><input id="memory-personal" type="checkbox" role="switch"></label>
+            <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
+          </form>
+        </section>
+        <section id="panel-feishu" class="settings-panel" role="tabpanel" aria-labelledby="tab-feishu" hidden>
+          <div class="settings-panel-header">
+            <div><h3 class="settings-panel-heading">飞书 IM</h3><p class="settings-panel-description">在飞书单聊中提交任务、查看进度和审批工具操作。</p></div>
+            <span id="feishu-status" class="feishu-status" role="status" hidden></span>
+          </div>
+          <p id="feishu-error" class="feishu-error" role="status" hidden></p>
+          <div class="feishu-scan">
+            <p>用手机飞书扫码创建机器人。授权后自动连接，并将扫码账号加入允许名单。</p>
+            <div class="feishu-scan-actions">
+              <button id="feishu-scan-start" class="primary" type="button" disabled>生成二维码</button>
+              <button id="feishu-scan-cancel" type="button" hidden>取消扫码</button>
+            </div>
+            <p id="feishu-scan-status" role="status" hidden></p>
+            <img id="feishu-scan-code" width="240" height="240" alt="用飞书扫一扫的配置二维码" hidden>
+            <a id="feishu-scan-link" target="_blank" rel="noopener noreferrer" hidden>打开飞书授权页</a>
+          </div>
+          <form id="feishu-settings-form">
+            <label for="feishu-approval-mode">飞书审批模式</label>
+            <select id="feishu-approval-mode">
+              <option value="manual">逐次审批</option>
+              <option value="allow">完全允许</option>
+            </select>
+            <p class="settings-field-hint">完全允许会跳过飞书白名单内所有用户的工具审批。</p>
+            <label class="feishu-clear-secret"><input id="feishu-approval-buttons" type="checkbox"> 使用审批按钮（飞书卡片回调已配置并发布）</label>
+            <details>
+              <summary>手动配置已有机器人</summary>
+                <p class="settings-note">在飞书企业自建应用中启用机器人。保存配置并连接后，在飞书后台启用长连接，订阅接收消息 <code>im.message.receive_v1</code> 和卡片回传 <code>card.action.trigger</code>。开通单聊消息读取、应用身份发消息和发送、删除消息表情回复权限后发布应用。 <a href="https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-" target="_blank" rel="noopener noreferrer">长连接配置指南</a></p>
+                <label class="capability-option" for="feishu-enabled"><span><strong>启用飞书连接</strong><small>允许名单内的用户可以与机器人单聊。</small></span><input id="feishu-enabled" type="checkbox" role="switch"></label>
+                <label for="feishu-app-id">App ID</label>
+                <input id="feishu-app-id" maxlength="128" pattern="cli_[A-Za-z0-9_]+" placeholder="cli_…" spellcheck="false">
+                <label for="feishu-app-secret">App Secret</label>
+                <input id="feishu-app-secret" type="password" autocomplete="new-password" maxlength="512" aria-describedby="feishu-secret-hint">
+                <p id="feishu-secret-hint" class="settings-field-hint"></p>
+                <label id="feishu-clear-secret-label" class="feishu-clear-secret" hidden><input id="feishu-clear-secret" type="checkbox"> 清除已保存的 App Secret</label>
+                <label for="feishu-open-ids">允许接入的用户 Open ID</label>
+                <textarea id="feishu-open-ids" rows="3" placeholder="ou_…" spellcheck="false" aria-describedby="feishu-open-ids-hint"></textarea>
+                <p id="feishu-open-ids-hint" class="settings-field-hint">每行一个，启用时至少填一位用户。在飞书 API 调试台选用当前应用并<a href="https://open.feishu.cn/document/home/user-identity-introduction/open-id" target="_blank" rel="noopener noreferrer">获取用户 Open ID</a>。</p>
+            </details>
             <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
           </form>
         </section>

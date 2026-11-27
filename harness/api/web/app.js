@@ -91,7 +91,7 @@ function requestErrorMessage(path, status, data) {
   const details = Array.isArray(data.detail) ? data.detail : [];
   const oldAssetRoute = details.some((item) =>
     Array.isArray(item.loc) && item.loc[0] === "path" && item.loc[1] === "asset");
-  if (["/ui/providers", "/ui/capabilities", "/ui/memory/settings"].includes(path) &&
+  if (["/ui/providers", "/ui/capabilities", "/ui/memory/settings", "/v1/settings/feishu"].includes(path) &&
       (status === 404 || (status === 422 && oldAssetRoute))) {
     return "页面与服务端版本不一致。请先处理进行中或暂停的任务，再重启 Mini Harness 并刷新页面。";
   }
@@ -99,6 +99,7 @@ function requestErrorMessage(path, status, data) {
   if (status === 422 && details.length) {
     // Only show known field names and fixed messages, never server-provided input values.
     const fields = new Set(["name", "model", "base_url", "api_key", "view", "register", "computer_use", "enabled", "automatic", "personal",
+      "app_id", "app_secret", "allowed_open_ids",
       "task", "worker_id", "worker_target", "approval_mode", "session_id", "upload_ids", "command", "timeout"]);
     const field = (Array.isArray(details[0].loc) ? details[0].loc : []).find((part) => fields.has(part));
     const kind = String(details[0].type || "");
@@ -1426,8 +1427,8 @@ async function openSettings(onlyIfMissing = false) {
     const config = await loadModel();
     if ((!onlyIfMissing || !config.configured) && !$("model-dialog").open) {
       settingsSession++;
-      settingsLoaded = { capabilities: false, memory: false };
-      settingsLoading = { capabilities: false, memory: false };
+      settingsLoaded = {};
+      settingsLoading = {};
       selectSettingsTab("providers");
       showProviderList();
       $("model-dialog").showModal();
@@ -1444,15 +1445,168 @@ async function openSettings(onlyIfMissing = false) {
 
 $("add-provider").addEventListener("click", () => editProvider());
 $("cancel-provider").addEventListener("click", showProviderList);
-const settingsTabs = ["providers", "capabilities", "memory"];
-let settingsLoaded = { capabilities: false, memory: false };
-let settingsLoading = { capabilities: false, memory: false };
+const settingsForms = {
+  capabilities: { id: "capabilities-form", path: "/ui/capabilities" },
+  memory: { id: "memory-settings-form", path: "/ui/memory/settings" },
+  feishu: { id: "feishu-settings-form", path: "/v1/settings/feishu" },
+};
+const settingsTabs = ["providers", ...Object.keys(settingsForms)];
+let settingsLoaded = {};
+let settingsLoading = {};
 let settingsSession = 0;
 let activeSettingsTab = "providers";
+let savedFeishuConfig = null;
+let feishuStatusVersion = 0;
+let feishuStatusPending = false;
+const feishuRegistrationPath = "/v1/settings/feishu/registration";
+let feishuRegistrationId = sessionStorage.getItem("feishu-registration");
+let feishuScanPending = false;
 
 function settingsStatus(message = "") {
   $("settings-status").textContent = message;
   $("settings-status").hidden = !message;
+}
+
+function hasSavedFeishuSecret() {
+  return savedFeishuConfig?.has_app_secret && $("feishu-app-id").value.trim() === savedFeishuConfig.app_id;
+}
+
+function updateFeishuSecretHint() {
+  const hasSecret = hasSavedFeishuSecret();
+  const canClear = hasSecret && !$("feishu-app-secret").value.trim();
+  $("feishu-clear-secret-label").hidden = !canClear;
+  if (!canClear) $("feishu-clear-secret").checked = false;
+  $("feishu-secret-hint").textContent = hasSecret ? "留空会保留当前应用的密钥。" : "在飞书开放平台的应用凭证页面获取。";
+}
+
+function showFeishuStatus(data) {
+  const badge = $("feishu-status");
+  const label = { disabled: "已停用", connecting: "连接中", connected: "已连接", error: "异常" }[data.status] || "状态未知";
+  if (badge.textContent !== label) badge.textContent = label;
+  badge.dataset.state = data.status;
+  badge.hidden = false;
+  const error = $("feishu-error");
+  const message = data.error || "";
+  if (error.textContent !== message) error.textContent = message;
+  error.hidden = !message;
+}
+
+function showFeishuSettings(data) {
+  savedFeishuConfig = data;
+  $("feishu-enabled").checked = data.enabled;
+  $("feishu-app-id").value = data.app_id;
+  $("feishu-app-secret").value = "";
+  $("feishu-clear-secret").checked = false;
+  $("feishu-open-ids").value = data.allowed_open_ids.join("\n");
+  $("feishu-approval-mode").value = data.approval_mode || "manual";
+  $("feishu-approval-buttons").checked = Boolean(data.approval_buttons);
+  updateFeishuSecretHint();
+  showFeishuStatus(data);
+  if (!feishuRegistrationId && !feishuScanPending) $("feishu-scan-start").disabled = false;
+}
+
+function showFeishuScan(data) {
+  const code = $("feishu-scan-code");
+  const link = $("feishu-scan-link");
+  const status = $("feishu-scan-status");
+  const active = ["starting", "waiting", "saving"].includes(data.status);
+  const message = {
+    starting: "正在生成二维码…",
+    waiting: "请用手机飞书扫一扫，并在手机上确认创建。",
+    saving: "已授权，正在保存连接…",
+    completed: "已保存机器人。请在飞书打开机器人，发送一条单聊消息。",
+    cancelled: "已取消扫码配置。",
+  };
+  status.textContent = data.error || message[data.status] || "";
+  status.hidden = !status.textContent;
+  if (data.qr_png && code.dataset.registration !== data.id) {
+    if (code.src) URL.revokeObjectURL(code.src);
+    const bytes = Uint8Array.from(atob(data.qr_png), (byte) => byte.charCodeAt(0));
+    code.src = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+    code.dataset.registration = data.id;
+    link.href = data.url;
+  } else if (!data.qr_png && code.dataset.registration) {
+    URL.revokeObjectURL(code.src);
+    code.removeAttribute("src");
+    delete code.dataset.registration;
+    link.removeAttribute("href");
+  }
+  code.hidden = link.hidden = !data.qr_png;
+  $("feishu-scan-start").disabled = active || !settingsLoaded.feishu;
+  $("feishu-scan-cancel").hidden = !active || data.status === "saving";
+  if (!active) {
+    feishuRegistrationId = null;
+    sessionStorage.removeItem("feishu-registration");
+  }
+  if (data.config) {
+    feishuStatusVersion++;
+    showFeishuSettings(data.config);
+  }
+}
+
+async function refreshFeishuScan() {
+  if (!feishuRegistrationId || feishuScanPending || activeSettingsTab !== "feishu" || !$("model-dialog").open) return;
+  const id = feishuRegistrationId;
+  feishuScanPending = true;
+  try {
+    showFeishuScan(await api(feishuRegistrationPath + "/" + id));
+  } catch (error) {
+    if (error.status === 404) showFeishuScan({ status: "expired", error: "二维码已失效，请重新生成。" });
+  } finally {
+    feishuScanPending = false;
+  }
+}
+
+$("feishu-scan-start").addEventListener("click", async () => {
+  if (feishuScanPending || feishuRegistrationId) return;
+  if (savedFeishuConfig?.app_id && !window.confirm("扫码创建的机器人会替换当前飞书连接。继续生成二维码？")) return;
+  feishuScanPending = true;
+  showFeishuScan({ status: "starting" });
+  try {
+    const data = await api(feishuRegistrationPath, { method: "POST" });
+    feishuRegistrationId = data.id;
+    sessionStorage.setItem("feishu-registration", data.id);
+    showFeishuScan(data);
+  } catch (error) {
+    showFeishuScan({ status: "error", error: error.message });
+  } finally {
+    feishuScanPending = false;
+    void refreshFeishuScan();
+  }
+});
+
+$("feishu-scan-cancel").addEventListener("click", async () => {
+  if (!feishuRegistrationId || feishuScanPending) return;
+  feishuScanPending = true;
+  try {
+    const path = feishuRegistrationPath + "/" + feishuRegistrationId;
+    await request(path, { method: "DELETE" });
+    showFeishuScan(await api(path));
+  } catch (error) {
+    modelError(error.message);
+  } finally {
+    feishuScanPending = false;
+  }
+});
+
+async function refreshFeishuStatus() {
+  if (
+    feishuStatusPending || activeSettingsTab !== "feishu" || !settingsLoaded.feishu ||
+    !$("model-dialog").open || document.hidden || $("feishu-settings-form").querySelector("[type=submit]").disabled
+  ) return;
+  const session = settingsSession;
+  const statusVersion = feishuStatusVersion;
+  feishuStatusPending = true;
+  try {
+    const data = await api(settingsForms.feishu.path);
+    if (session === settingsSession && statusVersion === feishuStatusVersion) showFeishuStatus(data);
+  } catch {
+    if (session === settingsSession && statusVersion === feishuStatusVersion) {
+      showFeishuStatus({ status: "unknown", error: "暂时无法读取连接状态。" });
+    }
+  } finally {
+    feishuStatusPending = false;
+  }
 }
 
 async function selectSettingsTab(name, focus = false) {
@@ -1471,21 +1625,27 @@ async function selectSettingsTab(name, focus = false) {
   if (settingsLoading[name]) { settingsStatus("正在读取设置…"); return; }
   settingsLoading[name] = true;
   const session = settingsSession;
-  const form = $(name === "capabilities" ? "capabilities-form" : "memory-settings-form");
-  const controls = form.querySelectorAll("input, button");
+  const { id, path } = settingsForms[name];
+  const controls = $(id).querySelectorAll("input, textarea, select, button");
   controls.forEach((control) => { control.disabled = true; });
+  if (name === "feishu") {
+    $("feishu-status").hidden = true;
+    $("feishu-error").hidden = true;
+  }
   settingsStatus("正在读取设置…");
   try {
-    const data = await api(name === "capabilities" ? "/ui/capabilities" : "/ui/memory/settings");
+    const data = await api(path);
     if (session !== settingsSession) return;
     if (name === "capabilities") {
       $("capability-view").checked = data.view;
       $("capability-register").checked = data.register;
       $("capability-computer-use").checked = data.computer_use;
-    } else {
+    } else if (name === "memory") {
       $("memory-enabled").checked = data.enabled;
       $("memory-automatic").checked = data.automatic;
       $("memory-personal").checked = data.personal;
+    } else {
+      showFeishuSettings(data);
     }
     settingsLoaded[name] = true;
     if (activeSettingsTab === name) settingsStatus();
@@ -1517,18 +1677,22 @@ for (const name of settingsTabs) {
   });
 }
 
-async function saveSettingsForm(event, name, path, body) {
+async function saveSettingsForm(event, name, body) {
   event.preventDefault();
   const session = settingsSession;
-  const controls = event.currentTarget.querySelectorAll("input, button");
+  const controls = event.currentTarget.querySelectorAll("input, textarea, select, button");
   const tabs = settingsTabs.map((tab) => $("tab-" + tab));
   controls.forEach((control) => { control.disabled = true; });
   tabs.forEach((tab) => { tab.disabled = true; });
   modelError();
   settingsStatus();
+  if (name === "feishu") feishuStatusVersion++;
   try {
-    await api(path, { method: "PUT", body });
-    if (session === settingsSession && activeSettingsTab === name) settingsStatus("更改已保存。");
+    const data = await api(settingsForms[name].path, { method: "PUT", body });
+    if (session === settingsSession) {
+      if (name === "feishu") showFeishuSettings(data);
+      if (activeSettingsTab === name) settingsStatus("更改已保存。");
+    }
     notice();
   } catch (error) {
     if (session === settingsSession && activeSettingsTab === name) modelError(error.message);
@@ -1538,20 +1702,49 @@ async function saveSettingsForm(event, name, path, body) {
   }
 }
 
-for (const formId of ["capabilities-form", "memory-settings-form"]) {
-  $(formId).addEventListener("change", () => settingsStatus());
+for (const { id } of Object.values(settingsForms)) {
+  $(id).addEventListener("change", () => settingsStatus());
 }
 
-$("capabilities-form").addEventListener("submit", (event) => void saveSettingsForm(event, "capabilities", "/ui/capabilities", {
+$("capabilities-form").addEventListener("submit", (event) => void saveSettingsForm(event, "capabilities", {
   view: $("capability-view").checked,
   register: $("capability-register").checked,
   computer_use: $("capability-computer-use").checked,
 }));
-$("memory-settings-form").addEventListener("submit", (event) => void saveSettingsForm(event, "memory", "/ui/memory/settings", {
+$("memory-settings-form").addEventListener("submit", (event) => void saveSettingsForm(event, "memory", {
   enabled: $("memory-enabled").checked,
   automatic: $("memory-automatic").checked,
   personal: $("memory-personal").checked,
 }));
+$("feishu-app-id").addEventListener("input", updateFeishuSecretHint);
+$("feishu-app-secret").addEventListener("input", updateFeishuSecretHint);
+$("feishu-settings-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const enabled = $("feishu-enabled").checked;
+  const appId = $("feishu-app-id").value.trim();
+  const appSecret = $("feishu-app-secret").value.trim();
+  const clearSecret = $("feishu-clear-secret").checked;
+  const openIds = [...new Set($("feishu-open-ids").value.split(/\r?\n/).map((id) => id.trim()).filter(Boolean))];
+  settingsStatus();
+  if (openIds.length > 100 || openIds.some((id) => id.length > 128 || !/^ou_[A-Za-z0-9_]+$/.test(id))) {
+    modelError("最多填写 100 个有效的用户 Open ID，每行一个，以 ou_ 开头。");
+    $("feishu-open-ids").focus();
+    return;
+  }
+  if (enabled && (!appId || !openIds.length || (!appSecret && (!hasSavedFeishuSecret() || clearSecret)))) {
+    $("feishu-settings-form").querySelector("details").open = true;
+    modelError("启用飞书连接需要填写 App ID、App Secret 和至少一位用户的 Open ID。");
+    return;
+  }
+  void saveSettingsForm(event, "feishu", {
+    enabled,
+    app_id: appId,
+    app_secret: appSecret || (clearSecret ? "" : null),
+    allowed_open_ids: openIds,
+    approval_mode: $("feishu-approval-mode").value,
+    approval_buttons: $("feishu-approval-buttons").checked,
+  });
+});
 $("model-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("model-form").querySelector("[type=submit]");
@@ -1714,7 +1907,11 @@ for (const button of actionButtons) {
 
 $("settings").addEventListener("click", () => void openSettings());
 $("close-settings").addEventListener("click", () => $("model-dialog").close());
-$("model-dialog").addEventListener("close", () => { settingsSession++; $("api-key").value = ""; });
+$("model-dialog").addEventListener("close", () => {
+  settingsSession++;
+  $("api-key").value = "";
+  $("feishu-app-secret").value = "";
+});
 $("menu").addEventListener("click", () => sidebar(!$("sidebar").classList.contains("open")));
 function closeSidebar() {
   sidebar(false);
@@ -1821,6 +2018,8 @@ window.addEventListener("hashchange", () => select(location.hash.slice(1)));
 select(location.hash.slice(1));
 void openSettings(true);
 setInterval(refresh, 1600);
+setInterval(refreshFeishuStatus, 3000);
+setInterval(refreshFeishuScan, 1500);
 setInterval(() => {
   if (run?.status !== "running" || document.hidden) return;
   const view = turns.get(run.id);

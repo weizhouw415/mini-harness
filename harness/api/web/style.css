@@ -675,7 +675,7 @@ dialog::backdrop { background: #27213f64; }
 dialog h2 { margin: 0 0 16px; font-size: 20px; }
 dialog h3 { margin: 0 0 16px; font-size: 15px; }
 dialog label { font-size: 13px; font-weight: 600; }
-dialog input:not([type="checkbox"]) {
+dialog input:not([type="checkbox"]), dialog textarea {
   display: block;
   width: 100%;
   margin: 5px 0 15px;
