@@ -48,7 +48,7 @@ class FeishuRegistration:
             from lark_oapi import aregister_app
             from lark_oapi.scene.registration.errors import AppAccessDeniedError, AppExpiredError
         except ImportError:
-            self._finish("error", error="缺少飞书扫码依赖，请重新安装 mini-harness 的 feishu 扩展。")
+            self._finish("error", error="缺少飞书扫码依赖。请使用 mini-harness local 重新启动，或重新安装 mini-harness。")
             return
 
         def show_code(info: dict):

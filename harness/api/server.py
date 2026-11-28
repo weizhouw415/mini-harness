@@ -26,7 +26,7 @@ from harness.core.agent import Agent
 from harness.core.llm import ModelError, OpenAICompatible
 from harness.execution.router import WorkerCallError, WorkerDisconnected, WorkerManager, WorkerTarget, WorkerUnavailable
 from harness.skills.migration import migrate_skill_catalog
-from harness.storage.sqlite import Conflict, NotFound, RunStore
+from harness.storage.sqlite import Conflict, NotFound, RunStore, SessionChannel
 from harness.memory.store import MemoryStore
 from harness.memory.jobs import MemoryJobs
 from harness.skills.jobs import SkillReviewJobs
@@ -137,7 +137,7 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
     def start(task: str, session_id: str | None, worker_id: str | None,
               approval_mode: Literal["manual", "auto", "allow", "legacy"] = "legacy",
               upload_ids: list[str] | None = None, *, worker_target: WorkerTarget | None = None,
-              memory_input: str | None = None, run_id: str | None = None):
+              memory_input: str | None = None, run_id: str | None = None, channel: SessionChannel = "web"):
         if upload_ids and not task.strip():
             task = "请查看我上传的附件。"
         if not task.strip() or len(task) > MAX_TASK_LENGTH:
@@ -146,12 +146,12 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
             raise HTTPException(422, "Specify either worker_id or worker_target.")
         run = store.create(task, session_id, worker_id, approval_mode, upload_ids=upload_ids,
                            worker_target=worker_target, memory_input=memory_input if memory_input is not None else task,
-                           run_id=run_id)
+                           run_id=run_id, channel=channel)
         agent.schedule(run["id"])
         return store.get(run["id"], include_files=True)
 
-    def start_feishu(task: str, session_id: str | None, run_id: str, mode: Literal["manual", "allow"]):
-        return start(task, session_id, None, mode, worker_target="browser", run_id=run_id)
+    def start_feishu(task: str, session_id: str | None, run_id: str):
+        return start(task, session_id, None, "auto", worker_target="browser", run_id=run_id, channel="feishu")
 
     def decide_approval(run_id: str, request: ApprovalRequest):
         run = store.get(run_id)
@@ -162,14 +162,8 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
         agent.schedule(run_id)
         return store.get(run_id)
 
-    def decide_feishu(run_id: str, call_id: str, approved: bool, *, scope: str):
-        if scope == "once":
-            decide_approval(run_id, ApprovalRequest(call_id=call_id, approved=approved))
-            return
-        _, requeued = store.update_approval_mode(run_id, "allow", expected_call_id=call_id,
-                                                allow_feishu_session=scope == "session")
-        if requeued:
-            agent.schedule(run_id)
+    def decide_feishu(run_id: str, call_id: str, approved: bool):
+        decide_approval(run_id, ApprovalRequest(call_id=call_id, approved=approved))
 
     feishu = FeishuService(store, start_feishu, feishu_transport_factory, decide_feishu)
     feishu_registration = FeishuRegistration(feishu)
@@ -482,8 +476,8 @@ def create_app(settings: Settings | None = None, *, llm=None, worker_manager=Non
         return store.recent()
 
     @app.get("/v1/sessions", dependencies=control)
-    async def list_sessions():
-        return store.recent_sessions()
+    async def list_sessions(channel: SessionChannel | None = None):
+        return store.recent_sessions(channel)
 
     @app.get("/v1/sessions/{session_id}/runs", dependencies=control)
     async def list_session_runs(session_id: str):

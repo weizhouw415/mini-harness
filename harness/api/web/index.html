@@ -19,8 +19,14 @@
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
       新建对话
     </button>
-    <div class="history-label" id="history-label">最近对话</div>
-    <nav id="history" aria-labelledby="history-label"></nav>
+    <nav id="history" aria-label="对话渠道">
+      <details id="feishu-history-group">
+        <summary class="history-label" id="feishu-history-label">飞书对话</summary>
+        <div id="feishu-history" class="channel-history" role="group" aria-labelledby="feishu-history-label"></div>
+      </details>
+      <div class="history-label" id="history-label">网页对话</div>
+      <div id="web-history" class="channel-history" role="group" aria-labelledby="history-label"></div>
+    </nav>
     <footer class="sidebar-footer">
       <span id="connection"><i></i> 未连接</span>
       <button id="settings" type="button">
@@ -220,30 +226,40 @@
         </section>
         <section id="panel-feishu" class="settings-panel" role="tabpanel" aria-labelledby="tab-feishu" hidden>
           <div class="settings-panel-header">
-            <div><h3 class="settings-panel-heading">飞书 IM</h3><p class="settings-panel-description">在飞书单聊中提交任务、查看进度和审批工具操作。</p></div>
+            <div><h3 class="settings-panel-heading">飞书 IM</h3><p class="settings-panel-description">在飞书里提交任务并接收进度和结果。</p></div>
             <span id="feishu-status" class="feishu-status" role="status" hidden></span>
           </div>
           <p id="feishu-error" class="feishu-error" role="status" hidden></p>
-          <div class="feishu-scan">
-            <p>用手机飞书扫码创建机器人。授权后自动连接，并将扫码账号加入允许名单。</p>
-            <div class="feishu-scan-actions">
-              <button id="feishu-scan-start" class="primary" type="button" disabled>生成二维码</button>
-              <button id="feishu-scan-cancel" type="button" hidden>取消扫码</button>
+          <section class="feishu-scan" aria-labelledby="feishu-scan-heading">
+            <div class="feishu-scan-header">
+              <div class="feishu-scan-icon" aria-hidden="true">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M8 4H5a1 1 0 0 0-1 1v3m12-4h3a1 1 0 0 1 1 1v3M4 16v3a1 1 0 0 0 1 1h3m8 0h3a1 1 0 0 0 1-1v-3M7 12h10"/></svg>
+              </div>
+              <div>
+                <h4 id="feishu-scan-heading">扫码连接机器人</h4>
+                <p>用飞书扫一扫。授权后，扫码账号即可与机器人单聊。</p>
+                <div class="feishu-scan-actions">
+                  <button id="feishu-scan-start" class="primary" type="button" disabled>生成二维码</button>
+                  <button id="feishu-scan-cancel" type="button" hidden>取消扫码</button>
+                </div>
+              </div>
             </div>
-            <p id="feishu-scan-status" role="status" hidden></p>
-            <img id="feishu-scan-code" width="240" height="240" alt="用飞书扫一扫的配置二维码" hidden>
-            <a id="feishu-scan-link" target="_blank" rel="noopener noreferrer" hidden>打开飞书授权页</a>
+            <div id="feishu-scan-result" class="feishu-scan-result" hidden>
+              <img id="feishu-scan-code" width="176" height="176" alt="用飞书扫一扫的配置二维码" hidden>
+              <div>
+                <p id="feishu-scan-status" role="status"></p>
+                <a id="feishu-scan-link" target="_blank" rel="noopener noreferrer" hidden>打开飞书授权页</a>
+              </div>
+            </div>
+          </section>
+          <div class="feishu-policy">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 7 3v5c0 4.6-2.8 7.6-7 10-4.2-2.4-7-5.4-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg>
+            <p>常规操作自动通过，高风险操作会发送飞书审批卡片。</p>
           </div>
           <form id="feishu-settings-form">
-            <label for="feishu-approval-mode">飞书审批模式</label>
-            <select id="feishu-approval-mode">
-              <option value="manual">逐次审批</option>
-              <option value="allow">完全允许</option>
-            </select>
-            <p class="settings-field-hint">完全允许会跳过飞书白名单内所有用户的工具审批。</p>
-            <label class="feishu-clear-secret"><input id="feishu-approval-buttons" type="checkbox"> 使用审批按钮（飞书卡片回调已配置并发布）</label>
             <details>
-              <summary>手动配置已有机器人</summary>
+              <summary>管理已有机器人</summary>
+              <div class="feishu-manual-fields">
                 <p class="settings-note">在飞书企业自建应用中启用机器人。保存配置并连接后，在飞书后台启用长连接，订阅接收消息 <code>im.message.receive_v1</code> 和卡片回传 <code>card.action.trigger</code>。开通单聊消息读取、应用身份发消息和发送、删除消息表情回复权限后发布应用。 <a href="https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-" target="_blank" rel="noopener noreferrer">长连接配置指南</a></p>
                 <label class="capability-option" for="feishu-enabled"><span><strong>启用飞书连接</strong><small>允许名单内的用户可以与机器人单聊。</small></span><input id="feishu-enabled" type="checkbox" role="switch"></label>
                 <label for="feishu-app-id">App ID</label>
@@ -255,8 +271,9 @@
                 <label for="feishu-open-ids">允许接入的用户 Open ID</label>
                 <textarea id="feishu-open-ids" rows="3" placeholder="ou_…" spellcheck="false" aria-describedby="feishu-open-ids-hint"></textarea>
                 <p id="feishu-open-ids-hint" class="settings-field-hint">每行一个，启用时至少填一位用户。在飞书 API 调试台选用当前应用并<a href="https://open.feishu.cn/document/home/user-identity-introduction/open-id" target="_blank" rel="noopener noreferrer">获取用户 Open ID</a>。</p>
+                <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
+              </div>
             </details>
-            <div class="dialog-actions settings-panel-actions"><button class="primary" type="submit">保存更改</button></div>
           </form>
         </section>
         <p id="model-error" role="alert" hidden></p>

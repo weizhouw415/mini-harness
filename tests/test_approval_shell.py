@@ -1,10 +1,10 @@
 import unittest
 
-from harness.core.approval_shell import is_safe_bash
+from harness.core.approval_shell import destructive_command_reason, is_safe_bash
 
 
-class BashAutoApprovalTest(unittest.TestCase):
-    def test_approves_common_read_only_commands(self):
+class ReadOnlyBashTest(unittest.TestCase):
+    def test_recognizes_common_read_only_commands(self):
         for command in (
             "pwd",
             " \tpwd -P\t",
@@ -26,7 +26,7 @@ class BashAutoApprovalTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertTrue(is_safe_bash(command))
 
-    def test_requires_approval_for_shell_syntax_with_side_effects(self):
+    def test_rejects_shell_syntax_with_side_effects(self):
         for command in (
             "echo hello; touch item",
             "echo hello\ntouch item",
@@ -54,7 +54,7 @@ class BashAutoApprovalTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(is_safe_bash(command))
 
-    def test_requires_approval_for_commands_and_options_with_side_effects(self):
+    def test_rejects_commands_and_options_with_side_effects(self):
         for command in (
             "rm report.txt",
             "bash -c 'pwd'",
@@ -76,3 +76,41 @@ class BashAutoApprovalTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertFalse(is_safe_bash(command))
+
+
+class DestructiveBashTest(unittest.TestCase):
+    def test_recognizes_high_risk_commands_in_common_shell_forms(self):
+        for command in (
+            "rm -rf -- /",
+            "echo done && sudo -u root /bin/rm -f -R -- 'old project'",
+            "echo before # comment\nrm --force --recursive removed",
+            "bash -lc 'env MODE=test rm -fR removed'",
+            "if test -d folder; then rm -r -f folder; fi",
+            "rm -\\\nrf removed",
+            "rm -r -- \"$HOME\"",
+            r"find . -type d -exec rm -rf {} \;",
+            "find . -name '*.tmp' -delete",
+            "find . -type d -print0 | xargs -0 rm -rf",
+            "git -C working-copy reset --hard",
+            "git clean -xfd",
+            "diskutil eraseDisk APFS New /dev/disk2",
+            "mkfs.ext4 /dev/sda",
+            "dd if=archive.img of=/dev/disk2",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(destructive_command_reason(command))
+
+    def test_allows_routine_edits_and_literal_command_text(self):
+        for command in (
+            "printf done > report.txt",
+            "rm -f temporary.txt",
+            "rm -r -- -f",
+            "grep 'rm -rf /' README.md",
+            "printf '%s' rm -rf /",
+            "cat > notes.txt <<'EOF'\nrm -rf /\nEOF",
+            r"find . -exec echo -delete \;",
+            "git clean -ndf",
+            "dd if=archive.img of=/dev/null",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(destructive_command_reason(command))

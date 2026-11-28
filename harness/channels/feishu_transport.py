@@ -35,6 +35,10 @@ class FeishuReplyUnavailable(FeishuTransportError):
     """Feishu rejected the source message as a reply target."""
 
 
+class FeishuCardUnavailable(FeishuTransportError):
+    """The sent card can no longer be updated."""
+
+
 def _object(value) -> dict:
     return value if isinstance(value, dict) else {}
 
@@ -92,7 +96,7 @@ class FeishuTransport:
             from lark_channel.ws.pb.pbbp2_pb2 import Frame
             from lark_channel.ws.pb.google.protobuf.message import DecodeError
         except ImportError:
-            raise FeishuTransportError("缺少飞书 SDK，请安装 mini-harness 的 feishu 扩展。") from None
+            raise FeishuTransportError("缺少飞书 SDK。请使用 mini-harness local 重新启动，或重新安装 mini-harness。") from None
 
         async with httpx.AsyncClient(base_url=FEISHU_URL, timeout=10) as http:
             payload = await self._post(http, "/callback/ws/endpoint", "获取飞书长连接地址",
@@ -194,7 +198,7 @@ class FeishuTransport:
         del fragments[frame_id]
         return b"".join(part for part in parts if part is not None)
 
-    async def _message_request(self, message_id: str, suffix: str, operation: str, **kwargs) -> dict:
+    async def _message_request(self, message_id: str, operation: str, *, suffix: str = "", **kwargs) -> dict:
         if not MESSAGE_ID.fullmatch(message_id):
             raise FeishuTransportError("无效的飞书消息 ID。")
         async with httpx.AsyncClient(base_url=FEISHU_URL, timeout=10) as http:
@@ -209,23 +213,39 @@ class FeishuTransport:
                     self._tenant_token = token
                     self._token_expiry = monotonic() + max(0, expire - 60)
                 token = self._tenant_token
-            return await self._post(http, f"/open-apis/im/v1/messages/{message_id}/{suffix}", operation,
+            path = f"/open-apis/im/v1/messages/{message_id}"
+            if suffix:
+                path += f"/{suffix}"
+            return await self._post(http, path, operation,
                                     headers={"Authorization": f"Bearer {token}"}, **kwargs)
 
-    async def reply(self, message_id: str, text: str, uuid: str, *, card: dict | None = None) -> None:
+    async def reply(self, message_id: str, text: str, uuid: str, *, card: dict | None = None) -> str | None:
         payload = {"msg_type": "interactive" if card is not None else "text", "uuid": uuid,
                    "content": json.dumps(card if card is not None else {"text": text}, ensure_ascii=False)}
         try:
-            await self._message_request(message_id, "reply", "回复飞书消息", json=payload)
+            result = await self._message_request(message_id, "回复飞书消息", suffix="reply", json=payload)
         except FeishuTransportError as error:
             if error.code in {230011, 230054, 230111}:
                 raise FeishuReplyUnavailable(str(error), code=error.code) from None
             if card is None or error.code != 230099 or not text:
                 raise
-            await self.reply(message_id, text, uuid + "-text")
+            return await self.reply(message_id, text, uuid + "-text")
+        sent_id = _object(result.get("data")).get("message_id")
+        if isinstance(sent_id, str) and MESSAGE_ID.fullmatch(sent_id):
+            return sent_id
+        return None
+
+    async def update_card(self, message_id: str, card: dict) -> None:
+        try:
+            await self._message_request(message_id, "更新飞书消息卡片", method="PATCH",
+                                        json={"content": json.dumps(card, ensure_ascii=False, separators=(",", ":"))})
+        except FeishuTransportError as error:
+            if error.code in {230011, 230031, 230110, 404}:
+                raise FeishuCardUnavailable(str(error), code=error.code) from None
+            raise
 
     async def add_typing(self, message_id: str) -> str:
-        result = await self._message_request(message_id, "reactions", "添加飞书消息表情",
+        result = await self._message_request(message_id, "添加飞书消息表情", suffix="reactions",
                                              json={"reaction_type": {"emoji_type": "Typing"}})
         reaction = _object(result.get("data")).get("reaction_id")
         if not isinstance(reaction, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", reaction):
@@ -236,7 +256,8 @@ class FeishuTransport:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", reaction_id):
             raise FeishuTransportError("无效的飞书表情 ID。")
         try:
-            await self._message_request(message_id, f"reactions/{reaction_id}", "移除飞书消息表情", method="DELETE")
+            await self._message_request(message_id, "移除飞书消息表情",
+                                        suffix=f"reactions/{reaction_id}", method="DELETE")
         except FeishuTransportError as error:
             if error.code not in {230110, 231003, 231004, 231005, 231011, 404}:
                 raise

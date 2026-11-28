@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 
 from harness.channels import feishu_transport
-from harness.channels.feishu_transport import FeishuReplyUnavailable, FeishuTransport, FeishuTransportError
+from harness.channels.feishu_transport import FeishuCardUnavailable, FeishuReplyUnavailable, FeishuTransport, FeishuTransportError
 
 
 class FeishuTransportTest(unittest.IsolatedAsyncioTestCase):
@@ -119,3 +119,66 @@ class FeishuTransportTest(unittest.IsolatedAsyncioTestCase):
             body = json.loads(request.content)
             self.assertEqual(body["uuid"], "stable")
             self.assertEqual(json.loads(body["content"]), {"text": "回复"})
+
+    async def test_patch_updates_the_card_returned_by_reply(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if request.url.path.endswith("/tenant_access_token/internal"):
+                return httpx.Response(200, json={"code": 0, "tenant_access_token": "t_test", "expire": 7200})
+            if request.method == "POST":
+                return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_progress"}})
+            return httpx.Response(200, json={"code": 0})
+
+        def card(content):
+            return {
+                "schema": "2.0", "config": {"update_multi": True},
+                "body": {"elements": [{"tag": "markdown", "content": content}]},
+            }
+
+        client_class = httpx.AsyncClient
+        with patch.object(feishu_transport.httpx, "AsyncClient", side_effect=lambda **kwargs: client_class(
+                transport=httpx.MockTransport(respond), **kwargs)):
+            transport = FeishuTransport("cli_test", "test-secret")
+            sent_id = await transport.reply("om_source", "", "stable", card=card("开始"))
+            self.assertEqual(sent_id, "om_progress")
+            await transport.update_card(sent_id, card("完成"))
+
+        _, send, update = requests
+        sent_body = json.loads(send.content)
+        self.assertEqual((send.method, send.url.path), ("POST", "/open-apis/im/v1/messages/om_source/reply"))
+        self.assertEqual(sent_body["msg_type"], "interactive")
+        self.assertEqual(json.loads(sent_body["content"]), card("开始"))
+        self.assertEqual((update.method, update.url.path), ("PATCH", "/open-apis/im/v1/messages/om_progress"))
+        self.assertEqual(update.headers["Authorization"], "Bearer t_test")
+        updated_body = json.loads(update.content)
+        self.assertEqual(list(updated_body), ["content"])
+        self.assertEqual(json.loads(updated_body["content"]), card("完成"))
+
+    async def test_terminal_card_errors_are_distinguished_from_rate_limits(self):
+        transport = FeishuTransport("cli_test", "test-secret")
+        for code in (230011, 230031, 230110, 404, 230020):
+            with self.subTest(code=code), patch.object(
+                transport, "_message_request", side_effect=FeishuTransportError("test error", code=code),
+            ):
+                with self.assertRaises(FeishuTransportError) as error:
+                    await transport.update_card("om_progress", {"config": {"update_multi": True}})
+                self.assertEqual(error.exception.code, code)
+                self.assertEqual(isinstance(error.exception, FeishuCardUnavailable), code != 230020)
+
+    async def test_reply_only_falls_back_to_text_when_one_is_provided(self):
+        transport = FeishuTransport("cli_test", "test-secret")
+        card = {"body": {"elements": []}}
+        invalid_card = FeishuTransportError("invalid card", code=230099)
+        with patch.object(transport, "_message_request", side_effect=invalid_card) as request:
+            with self.assertRaises(FeishuTransportError):
+                await transport.reply("om_source", "", "stable", card=card)
+            self.assertEqual(request.await_count, 1)
+
+        sent = {"data": {"message_id": "om_text"}}
+        with patch.object(transport, "_message_request", side_effect=[invalid_card, sent]) as request:
+            self.assertEqual(await transport.reply("om_source", "回复", "stable", card=card), "om_text")
+            self.assertEqual(request.await_args.kwargs["json"], {
+                "msg_type": "text", "uuid": "stable-text", "content": json.dumps({"text": "回复"}, ensure_ascii=False),
+            })

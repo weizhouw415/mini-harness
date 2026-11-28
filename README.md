@@ -53,7 +53,7 @@ Docker 中的 Worker 串行处理 Run，每次创建新的工作目录与 Chromi
 
 ## 接入飞书 IM
 
-Docker 服务端镜像包含飞书依赖。使用本地 Python 安装时，在服务端环境运行 `python -m pip install -e '.[feishu]'` 并重启服务。飞书只需要服务端能够访问飞书开放平台，无需公开本地 API。
+飞书依赖随 Mini Harness 一起安装，Docker 服务端镜像也会包含这些依赖。旧版本地环境运行 `mini-harness local` 时会自动补装缺失的飞书依赖。飞书只需要服务端能够访问飞书开放平台，无需公开本地 API。
 
 在「设置 → 飞书 IM」点击「生成二维码」，用手机飞书扫一扫并确认创建。Mini Harness 会自动保存机器人凭证、启用连接，并仅将扫码账号加入允许名单。确认后，在手机飞书打开机器人并发送单聊消息。如企业要求审批，按飞书页面提示完成审批后再测试消息。已有机器人可以展开「手动配置已有机器人」。 [飞书官方扫码注册说明](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/README.zh.md#一键创建应用)
 
@@ -63,11 +63,11 @@ Docker 服务端镜像包含飞书依赖。使用本地 Python 安装时，在�
 2. 在 Mini Harness 本地 Web UI 中打开「设置 → 飞书 IM」，填写 App ID、App Secret 和允许的用户 Open ID，启用并保存。等待页面显示已连接。使用 API Token 管理的服务也可调用 `PUT /v1/settings/feishu`。飞书会在保存长连接配置时检查客户端是否在线。 [长连接说明](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
 3. 在飞书应用的「事件与回调」中选择长连接，添加「接收消息」事件 `im.message.receive_v1` 和「卡片回传交互」回调 `card.action.trigger`。开通「发送、删除消息表情回复」权限 `im:message.reactions:write_only`，发布应用版本并确认白名单用户在应用可用范围内。已有机器人也可按这一步补充回调和表情权限。 [卡片交互配置](https://open.feishu.cn/document/feishu-cards/configuring-card-interactions) · [消息表情 API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1#emoji-reply)
 
-同一个用户的消息会在独立会话里依次处理。收到任务后，机器人在原消息上添加「正在输入」表情，发完最终回复后移除。工具步骤按批次回复到原消息，最终回复使用飞书 Markdown 卡片。审批默认使用飞书卡片内的指令。`/approve <审批码>` 同意本次，`/approve-session <审批码>` 允许本会话当前任务及后续任务的工具操作，`/deny <审批码>` 拒绝本次。`/approval manual` 撤销本会话对新任务的授权。
+同一个用户的消息会在独立会话里依次处理。收到任务后，机器人在原消息上添加「正在输入」表情，发完最终回复后移除。每个任务的工具进度集中在一张原地更新的卡片里，显示最近几条命令及执行状态。完整记录可在网页查看。最终回复单独发送。
 
-飞书长连接收到消息后，审批指令即可使用。希望使用按钮时，在飞书侧确认 `card.action.trigger` 长连接回调已配置并发布，然后在 Mini Harness 飞书 IM 设置中勾选「使用审批按钮」。如果飞书开发后台无法打开扫码创建的应用，仍可直接在对话里使用审批指令。飞书 IM 设置中的「完全允许」会为所有白名单用户跳过工具审批，并放行正在等待审批的飞书任务。恢复「逐次审批」后，新任务恢复默认策略，此前单独授权的会话可用 `/approval manual` 撤销。
+飞书会话统一使用自动审批。识别到高风险操作时，机器人会发出审批卡片，可点「同意本次」或「拒绝」。扫码创建时会请求配置卡片回调。手动接入的机器人需要按上述步骤启用回调。按钮不可用时，可用卡片里的审批码发送 `/approve <审批码>` 或 `/deny <审批码>`。
 
-任务使用浏览器 Worker。任务暂停时可在 Mini Harness 网页中恢复或取消。禁用连接会停止从飞书接收和回复，已创建的任务仍可在网页中操作。重新启用同一个应用后，网关继续处理已接收的消息。
+任务使用浏览器 Worker。在网页侧栏展开「飞书对话」可查看记录、审批、恢复或取消任务。继续对话时请在飞书里发送消息。禁用连接会停止从飞书接收和回复，已创建的任务仍可在网页中操作。重新启用同一个应用后，网关继续处理已接收的消息。
 
 首版支持单聊文本。把飞书白名单限定在信任此 Harness 实例的用户内。个人跨会话记忆开启后，同一实例中的不同会话可能访问全局记忆。
 
@@ -108,7 +108,7 @@ harness computer scroll down 500
 
 `--observe` 会在动作后返回截图。`screenshot --output` 同时保存一份到工作区，后续 Bash 调用可用 `harness view screen.png` 查看。云端浏览器还支持 `navigate`、元素选择器和工作区文件上传下载。
 
-界面动作沿用截图、导航、鼠标、键盘及文件操作各自的审批规则。`HARNESS_TRUST_CLOUD_BASH` 适用于普通 Shell 命令，界面动作仍由图形审批判断。桌面 Bash 与 GUI 由 Worker 分别授权，启用桌面 Bash 后，Shell 命令以当前操作系统账号执行。
+自动审批会放行 Worker 支持的界面操作。桌面 Bash 与 GUI 由 Worker 分别授权，启用桌面 Bash 后，Shell 命令以当前操作系统账号执行。
 
 运行 `python -m workers.desktop --pause` 可暂停 Worker。操作当前桌面时，也可以把鼠标移至主屏幕角落触发暂停。用 `python -m workers.desktop --resume` 解除本地暂停。结束 Worker 进程会断开远程控制。
 
@@ -160,7 +160,7 @@ mini-harness memory --session SESSION_ID forget MEMORY_ID
 设置保存在 `HARNESS_DATA_DIR/model.json`，下次启动会优先使用已保存的配置；未保存时使用环境变量。已有的单模型配置会自动保留为一组供应商配置。
 在「设置 → 任务能力」中可以分别启用或关闭文件预览（`view`）、文件交付（`register`）和界面操作（`computer_use`）。默认均启用，Bash 始终可用；全部关闭时，模型仅通过 Bash 执行任务。设置保存在 `HARNESS_DATA_DIR/capabilities.json`，每个任务开始时固定一份配置，暂停恢复时沿用；修改只影响之后开始的任务。关闭能力时，需同时更新独立运行的 Worker 到支持能力开关的版本。
 免 Token 连接只用于直接访问本机回环地址的浏览器页面，CLI 和外部 API 客户端仍使用 `HARNESS_API_TOKEN`。
-侧栏显示最近 100 个对话及其运行状态，包括通过 CLI 创建的会话。对话运行时可点击「新建对话」开始另一条任务，也可以从侧栏切回查看回复和审批。每个对话在当前轮结束后可继续发送消息。
+侧栏按「网页对话」和「飞书对话」分别显示最多 100 个近期会话及其运行状态，通过 CLI 创建的会话列在「网页对话」中。点击「新建对话」会创建网页会话。网页会话在当前轮结束后可继续发送消息。
 助手回复支持 Markdown。每轮可展开运行轨迹和截图，也可以审批、恢复或取消当前运行。Enter 发送，Shift+Enter 换行。
 Harness 以流式方式向模型请求回复。模型返回的思考过程和正文会随生成进度显示，工具调用收齐后再审批和执行。模型请求的读取超时为 15 分钟，在等待下一段数据时计时。
 当模型服务明确拒绝在 Chat Completions 中同时使用推理和工具，并提示可将 `reasoning_effort` 设为 `none` 时，Harness 会关闭该次请求的推理并重试一次，运行轨迹会提示这一兼容处理。
@@ -179,12 +179,10 @@ API 客户端可向 `POST /v1/uploads` 发送 `application/octet-stream` 原始�
 输入框下方的审批模式可以在运行中切换。已经开始的工具操作会继续执行，正在等待审批和还未执行的操作按新模式判断。没有运行中的任务时，所选模式用于下一条消息。
 
 - **完全手动**：每次工具调用都需确认。
-- **自动审批**：桌面和浏览器 Worker 的截图和观察自动通过，浏览器还允许不移动指针的短距离滚动。启用了 Bash 的 Worker 可以自动运行符合规则的常见查看命令，包括读取文件和列出指定目录，以及受支持的只读命令组合；写入、运行未知程序和无法确认安全性的命令仍需确认。导航、点击、输入及上传下载也需要确认。运行轨迹会记录审批理由。
+- **自动审批**：日常终端命令和 Worker 支持的界面操作直接通过。识别到 `rm -rf`、磁盘格式化等高风险命令时等待确认。运行轨迹会记录审批理由。规则检查提交的命令，脚本内部的行为仍由 Worker 权限限制。
 - **完全允许**：工具调用直接执行。Worker 自己的权限限制继续生效。
 
-在单一信任域中，可以设置 `HARNESS_TRUST_CLOUD_BASH=1`，让隔离的浏览器 Worker 在自动审批模式中运行任意 Bash 命令。
-
-FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。创建 Run 时可用 `worker_id` 指定节点，或用 `worker_target` 选择 `desktop`、`browser`、`auto`。`auto` 优先空闲桌面，其次空闲浏览器。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为。未结束的 Run 可以用 `PATCH /v1/runs/{id}/approval-mode` 更改。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
+FastAPI 接口文档在 `/docs`。除健康检查和 Worker 握手外，请求使用 `Authorization: Bearer <HARNESS_API_TOKEN>`。核心入口是 `POST /v1/runs`、`GET /v1/runs/{id}` 和 `GET /v1/runs/{id}/events`。创建 Run 时可用 `worker_id` 指定节点，或用 `worker_target` 选择 `desktop`、`browser`、`auto`。`auto` 优先空闲桌面，其次空闲浏览器。API 调用方可在创建 Run 时传入 `"approval_mode": "auto"`，省略时沿用旧审批行为。未结束的网页 Run 可以用 `PATCH /v1/runs/{id}/approval-mode` 更改审批模式。`POST /v1/chat/completions` 提供非流式文本请求，长任务可通过返回的 Run ID 从核心接口继续查看。服务进程使用单个 Uvicorn 实例。
 
 ```bash
 python -m pip install -e '.[cloud]'

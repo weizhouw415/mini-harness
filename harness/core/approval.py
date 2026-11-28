@@ -1,8 +1,7 @@
 from dataclasses import dataclass
 
-from harness.core.approval_shell import is_safe_bash, is_safe_bash_legacy
+from harness.core.approval_shell import destructive_command_reason
 from harness.storage.sqlite import ApprovalMode
-from workers.common.actions import scroll_deltas
 
 
 @dataclass(frozen=True)
@@ -26,15 +25,10 @@ def decide_approval(mode: ApprovalMode, tool: str, args: dict, capabilities: dic
     if tool == "bash":
         if not (cloud or desktop) or capabilities.get("bash") is not True:
             return ApprovalDecision(True, "此 Worker 的终端命令需要人工确认。")
-        # Old Workers retain the previous rule. New Workers isolate PATH and
-        # their shell environment, allowing additional read-only commands.
-        if is_safe_bash_legacy(args["command"], allow_ls=cloud):
-            return ApprovalDecision(False, "匹配简单终端命令规则，不读取指定文件或执行 Shell 展开。")
-        if capabilities.get("safe_bash_path") is True and is_safe_bash(args["command"]):
-            return ApprovalDecision(False, "匹配只读终端命令规则。")
-        if cloud and trust_cloud_bash:
-            return ApprovalDecision(False, "服务端配置了信任此类浏览器 Worker 的终端命令。")
-        return ApprovalDecision(True, "命令未匹配自动放行的只读规则，需要人工确认。")
+        reason = destructive_command_reason(args["command"])
+        if reason:
+            return ApprovalDecision(True, reason)
+        return ApprovalDecision(False, "自动审批已放行此终端命令。")
 
     action = args["action"]
     target = args.get("target", "browser" if cloud else "desktop")
@@ -43,20 +37,4 @@ def decide_approval(mode: ApprovalMode, tool: str, args: dict, capabilities: dic
     required_action = "screenshot" if action == "screen_info" else action
     if capabilities.get("computer") is not True or not isinstance(actions, list) or required_action not in actions:
         return ApprovalDecision(True, "此 Worker 未声明支持该操作的自动审批。")
-    fields = set(args) - {"target", "observe", "output"}
-    if action in {"observe", "screenshot", "screen_info"} and fields == {"action"}:
-        if target == "browser":
-            return ApprovalDecision(False, "仅截图或观察当前浏览器页面。")
-        if desktop:
-            return ApprovalDecision(False, "仅查看当前已授权桌面 Worker 的屏幕。")
-    if target == "browser" and action == "scroll" and fields <= {"action", "dx", "dy", "direction", "amount"}:
-        try:
-            dx, dy = scroll_deltas(args)
-        except ValueError:
-            pass
-        else:
-            if max(abs(dx), abs(dy)) <= 4_000:
-                return ApprovalDecision(False, "仅滚动当前浏览器页面，未移动指针。")
-    if target == "browser":
-        return ApprovalDecision(True, "操作超出浏览器观察和滚动规则，需要人工确认。")
-    return ApprovalDecision(True, "此操作可能使用你的实际桌面、鼠标或键盘，需要人工确认。")
+    return ApprovalDecision(False, "自动审批已放行此界面操作。")

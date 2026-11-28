@@ -15,6 +15,7 @@ from harness.artifacts.files import MAX_FILE_BYTES, MAX_UPLOAD_BYTES, MAX_UPLOAD
 
 
 ApprovalMode = Literal["legacy", "manual", "auto", "allow"]
+SessionChannel = Literal["web", "feishu"]
 
 # Corrections in a subsequent turn are useful review signals even when the
 # conversation did not need many tool-calling iterations.
@@ -52,10 +53,8 @@ class RunStore:
                     result TEXT, created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS feishu_session_approvals (
-                    session_id TEXT PRIMARY KEY REFERENCES sessions(id)
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'web' CHECK(channel IN ('web', 'feishu'))
                 );
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
@@ -101,6 +100,18 @@ class RunStore:
                 CREATE INDEX IF NOT EXISTS run_file_paths ON run_files(run_id, source, path, version);
             """)
             db.execute("BEGIN IMMEDIATE")
+            session_columns = {row["name"] for row in db.execute("PRAGMA table_info(sessions)")}
+            if "channel" not in session_columns:
+                db.execute("""
+                    ALTER TABLE sessions ADD COLUMN channel TEXT NOT NULL DEFAULT 'web'
+                        CHECK(channel IN ('web', 'feishu'))
+                """)
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'feishu_inbox' AND type = 'table'").fetchone():
+                    db.execute("""
+                        UPDATE sessions SET channel = 'feishu' WHERE id IN (
+                            SELECT runs.session_id FROM runs JOIN feishu_inbox ON feishu_inbox.run_id = runs.id
+                        )
+                    """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
             if "approval_mode" not in columns:
                 db.execute("""
@@ -127,7 +138,7 @@ class RunStore:
     def create(self, task: str, session_id: str | None, worker_id: str | None,
                approval_mode: ApprovalMode = "legacy", *, upload_ids: list[str] | None = None,
                worker_target: str | None = None, memory_input: str | None = None,
-               run_id: str | None = None) -> dict:
+               run_id: str | None = None, channel: SessionChannel = "web") -> dict:
         run_id, workspace_id = run_id or uuid4().hex, uuid4().hex
         created = now()
         upload_ids = upload_ids or []
@@ -151,9 +162,14 @@ class RunStore:
                 raise Conflict("Total attachments exceed 40 MiB.")
             if session_id is None:
                 session_id = uuid4().hex
-                db.execute("INSERT INTO sessions VALUES (?, ?)", (session_id, created))
-            elif not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
-                raise NotFound("Session not found.")
+                db.execute("INSERT INTO sessions (id, created_at, channel) VALUES (?, ?, ?)",
+                           (session_id, created, channel))
+            else:
+                session = db.execute("SELECT channel FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if session is None:
+                    raise NotFound("Session not found.")
+                if session["channel"] != channel:
+                    raise Conflict("Send new messages through the session's original channel.")
             try:
                 db.execute(
                     """INSERT INTO runs (id, session_id, requested_worker, worker_target, workspace_id, task,
@@ -207,10 +223,10 @@ class RunStore:
             """).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_sessions(self) -> list[dict]:
+    def recent_sessions(self, channel: SessionChannel | None = None) -> list[dict]:
         with self.connect() as db:
             rows = db.execute("""
-                SELECT r.session_id AS id, r.id AS latest_run_id, r.status,
+                SELECT r.session_id AS id, r.id AS latest_run_id, r.status, s.channel,
                        (SELECT substr(first.task, 1, 160) FROM runs first
                         WHERE first.session_id = r.session_id
                         ORDER BY first.created_at, first.id LIMIT 1) AS title
@@ -219,20 +235,22 @@ class RunStore:
                     SELECT latest.id FROM runs latest WHERE latest.session_id = s.id
                     ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
                 )
+                WHERE (? IS NULL OR s.channel = ?)
                 ORDER BY r.updated_at DESC, r.id DESC LIMIT 100
-            """).fetchall()
+            """, (channel, channel)).fetchall()
         return [dict(row) for row in rows]
 
     def session_runs(self, session_id: str) -> list[dict]:
         with self.connect() as db:
-            if not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+            session = db.execute("SELECT channel FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if session is None:
                 raise NotFound("Session not found.")
             rows = db.execute("""
                 SELECT id, session_id, task, status, output, error, approval, approval_mode
                 FROM runs WHERE session_id = ? ORDER BY created_at, id
             """, (session_id,)).fetchall()
             return [
-                {**row, "approval": json.loads(row["approval"]) if row["approval"] else None,
+                {**row, "channel": session["channel"], "approval": json.loads(row["approval"]) if row["approval"] else None,
                  "files": self._run_files(db, row["id"])}
                 for row in rows
             ]
@@ -382,32 +400,20 @@ class RunStore:
         ).fetchone()[0]
         return iterations >= _SKILL_REVIEW_INTERVAL
 
-    def feishu_session_allowed(self, session_id: str) -> bool:
-        with self.connect() as db:
-            return db.execute("SELECT 1 FROM feishu_session_approvals WHERE session_id = ?",
-                              (session_id,)).fetchone() is not None
-
-    def revoke_feishu_session_approval(self, session_id: str):
-        with self.connect() as db:
-            db.execute("DELETE FROM feishu_session_approvals WHERE session_id = ?", (session_id,))
-
-    def update_approval_mode(self, run_id: str, mode: ApprovalMode, *, expected_call_id: str | None = None,
-                             allow_feishu_session: bool = False) -> tuple[dict, bool]:
+    def update_approval_mode(self, run_id: str, mode: ApprovalMode) -> tuple[dict, bool]:
         requeued = False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status, approval_mode, approval, session_id FROM runs WHERE id = ?",
-                             (run_id,)).fetchone()
+            row = db.execute("""
+                SELECT r.status, r.approval_mode, r.approval, s.channel
+                FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?
+            """, (run_id,)).fetchone()
             if row is None:
                 raise NotFound("Run not found.")
             if row["status"] not in {"queued", "running", "paused", "awaiting_approval"}:
                 raise Conflict("Approval mode can only be changed on an unfinished run.")
-            if expected_call_id is not None and (
-                row["status"] != "awaiting_approval" or json.loads(row["approval"])["call_id"] != expected_call_id
-            ):
-                raise Conflict("This call is not awaiting approval.")
-            if allow_feishu_session:
-                db.execute("INSERT OR IGNORE INTO feishu_session_approvals VALUES (?)", (row["session_id"],))
+            if row["channel"] == "feishu" and mode != "auto":
+                raise Conflict("飞书任务使用自动审批。")
             if row["approval_mode"] != mode:
                 requeued = row["status"] == "awaiting_approval"
                 db.execute(
@@ -423,6 +429,15 @@ class RunStore:
     def recover_interrupted(self):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            legacy_feishu = db.execute("""
+                SELECT r.id, r.approval_mode FROM runs r JOIN sessions s ON s.id = r.session_id
+                WHERE s.channel = 'feishu' AND r.approval_mode <> 'auto'
+                AND r.status IN ('queued', 'running', 'paused', 'awaiting_approval')
+            """).fetchall()
+            for run in legacy_feishu:
+                db.execute("UPDATE runs SET approval_mode = 'auto' WHERE id = ?", (run["id"],))
+                self._append(db, run["id"], "approval_mode_changed",
+                             {"previous_mode": run["approval_mode"], "approval_mode": "auto"})
             rows = db.execute("SELECT id FROM runs WHERE status IN ('running', 'queued')").fetchall()
             reason = "Server restarted. Resume explicitly to continue."
             for row in rows:

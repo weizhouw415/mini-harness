@@ -94,7 +94,7 @@ class LiveApprovalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_automatic_mode_keeps_an_unsafe_call_pending(self):
         worker = ApprovalWorker()
-        command = "printf content > note.txt"
+        command = "rm -rf -- project-directory"
         client, run_id = await self.start(worker, "manual", command)
         waiting = await wait_for_run(client, run_id, "awaiting_approval")
         self.assertEqual(waiting["status"], "awaiting_approval", waiting)

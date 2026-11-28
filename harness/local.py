@@ -2,13 +2,47 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+from importlib.metadata import requires
+from importlib.util import find_spec
 from pathlib import Path
+
+
+def _ensure_feishu_dependencies():
+    modules = {"lark_channel": "lark-channel-sdk", "lark_oapi": "lark-oapi", "qrcode": "qrcode"}
+    missing = {distribution for module, distribution in modules.items() if find_spec(module) is None}
+    if not missing:
+        return
+
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    # A checkout can contain newer requirements than its editable install metadata.
+    if project_file.is_file():
+        with project_file.open("rb") as project:
+            entries = tomllib.load(project)["project"]["dependencies"]
+    else:
+        entries = requires("mini-harness") or []
+    requirements = {}
+    for entry in entries:
+        requirement = entry.partition(";")[0].strip()
+        name = re.split(r"[^\w.-]", requirement, maxsplit=1)[0].lower()
+        if name in missing:
+            requirements[name] = requirement
+    if requirements.keys() != missing:
+        raise SystemExit("Mini Harness package metadata is out of date. Reinstall Mini Harness and try again.")
+
+    print("Installing Feishu dependencies…", flush=True)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "--disable-pip-version-check", "--no-input",
+                        "install", *requirements.values()], check=True)
+    except subprocess.CalledProcessError as error:
+        raise SystemExit("Could not install Feishu dependencies. Check your Python environment and package index.") from error
 
 
 def _chrome_executable(env: dict[str, str]) -> str | None:
@@ -39,6 +73,7 @@ def main(*, headless: bool = False):
             probe.bind(("127.0.0.1", 8000))
         except OSError as error:
             raise SystemExit("Port 8000 is unavailable. Stop the existing local server first.") from error
+    _ensure_feishu_dependencies()
 
     desktop = not headless and sys.platform in {"darwin", "win32"}
     worker_env = env.copy()

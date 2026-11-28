@@ -8,12 +8,13 @@ import tempfile
 from hashlib import sha256
 from pathlib import Path
 from time import time
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StringConstraints, model_validator
 
-from harness.channels.feishu_transport import FeishuReplyUnavailable, FeishuTransportError
+from harness.channels.feishu_progress import progress_card
+from harness.channels.feishu_transport import FeishuCardUnavailable, FeishuReplyUnavailable, FeishuTransportError
 from harness.storage.sqlite import Conflict, NotFound, RunStore
 
 
@@ -22,11 +23,8 @@ AppID = Annotated[str, StringConstraints(strip_whitespace=True, max_length=128, 
 OpenID = Annotated[str, StringConstraints(strip_whitespace=True, max_length=128, pattern=r"^ou_[A-Za-z0-9_]+$")]
 MAX_TASK_LENGTH = 16_000
 REPLY_CHARS = 5_000
-APPROVAL_COMMAND = re.compile(r"/(approve-session|approve|deny)\s+([a-f0-9]{12})", re.IGNORECASE)
-COMPUTER_ACTIONS = {
-    "navigate": "打开网页", "observe": "查看界面", "screenshot": "截取屏幕", "click": "点击",
-    "type": "输入文本", "scroll": "滚动页面", "press": "按键", "drag": "拖动",
-}
+PROGRESS_INTERVAL = 3
+APPROVAL_COMMAND = re.compile(r"/(approve|deny)\s+([a-f0-9]{12})", re.IGNORECASE)
 
 
 def markdown_card(text: str, buttons: list[dict] | None = None) -> dict:
@@ -37,24 +35,23 @@ def approval_code(run_id: str, call_id: str) -> str:
     return sha256(f"{run_id}:{call_id}".encode()).hexdigest()[:12]
 
 
-def approval_cards(run: dict, *, with_buttons: bool) -> list[dict]:
+def approval_cards(run: dict) -> list[dict]:
     approval = run["approval"]
     arguments = json.dumps(approval["arguments"], ensure_ascii=False, indent=2)
     call_id = approval["call_id"]
     code = approval_code(run["id"], call_id)
-    text = (f"**等待审批 · {approval['tool']}**\n\n```json\n{arguments}\n```\n\n"
+    reason = approval.get("reason")
+    reason_text = f"{reason}\n\n" if reason else ""
+    text = (f"**等待审批 · {approval['tool']}**\n\n{reason_text}```json\n{arguments}\n```\n\n"
             f"- `/approve {code}` 同意本次\n"
-            f"- `/approve-session {code}` 允许本会话后续操作（`/approval manual` 撤销）\n"
             f"- `/deny {code}` 拒绝本次")
     buttons = [
         {"tag": "button", "type": style, "text": {"tag": "plain_text", "content": label}, "behaviors": [
             {"type": "callback", "value": {"run_id": run["id"], "call_id": call_id,
-                                           "approved": approved, "scope": scope}}
+                                           "approved": approved}}
         ]}
-        for approved, scope, label, style in [(True, "once", "同意本次", "primary"),
-                                              (True, "session", "允许本会话", "default"),
-                                              (False, "once", "拒绝", "danger")]
-    ] if with_buttons else []
+        for approved, label, style in [(True, "同意本次", "primary"), (False, "拒绝", "danger")]
+    ]
     parts = list(markdown_parts(text))
     return [markdown_card(part, buttons if index == len(parts) - 1 else None)
             for index, part in enumerate(parts)]
@@ -95,8 +92,13 @@ class FeishuSettings(BaseModel):
     app_id: AppID
     app_secret: SecretStr | None = Field(default=None, max_length=512)
     allowed_open_ids: list[OpenID] = Field(max_length=100)
-    approval_mode: Literal["manual", "allow"] = "manual"
-    approval_buttons: StrictBool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_approval_settings(cls, data):
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key not in {"approval_mode", "approval_buttons"}}
+        return data
 
 
 class FeishuInbox:
@@ -119,7 +121,8 @@ class FeishuInbox:
                 CREATE INDEX IF NOT EXISTS feishu_inbox_pending ON feishu_inbox(app_id, sender) WHERE finished = 0;
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(feishu_inbox)")}
-            for name, definition in (("reaction_id", "TEXT"), ("progress_seq", "INTEGER NOT NULL DEFAULT 0"),
+            for name, definition in (("reaction_id", "TEXT"), ("progress_message_id", "TEXT"),
+                                     ("progress_seq", "INTEGER NOT NULL DEFAULT 0"),
                                      ("progress_at", "REAL NOT NULL DEFAULT 0")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE feishu_inbox ADD COLUMN {name} {definition}")
@@ -154,10 +157,32 @@ class FeishuInbox:
         with self.store.connect() as db:
             db.execute("UPDATE feishu_inbox SET reaction_id = ? WHERE run_id = ?", (reaction_id, run_id))
 
-    def progress_saved(self, run_id: str, seq: int):
+    def progress_events(self, run_id: str, after: int) -> list[dict]:
         with self.store.connect() as db:
-            db.execute("UPDATE feishu_inbox SET progress_seq = ?, progress_at = ? WHERE run_id = ?",
-                       (seq, time(), run_id))
+            rows = db.execute("""
+                SELECT seq, type,
+                    CASE type
+                        WHEN 'tool_result' THEN json_object(
+                            'call_id', json_extract(data, '$.call_id'),
+                            'result', json_object('error', json_extract(data, '$.result.error'),
+                                                  'exit_code', json_extract(data, '$.result.exit_code'),
+                                                  'outcome_unknown', json_extract(data, '$.result.outcome_unknown')))
+                        WHEN 'status' THEN json_object('status', json_extract(data, '$.status'))
+                        ELSE data
+                    END AS data
+                FROM events
+                WHERE run_id = ?1 AND type IN ('tool_call', 'tool_result', 'status')
+                    AND EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND seq > ?2
+                                AND type IN ('tool_call', 'tool_result', 'status'))
+                ORDER BY seq
+            """, (run_id, after)).fetchall()
+        return [{**row, "data": json.loads(row["data"])} for row in rows]
+
+    def progress_saved(self, run_id: str, seq: int, message_id: str):
+        with self.store.connect() as db:
+            db.execute("""
+                UPDATE feishu_inbox SET progress_seq = ?, progress_at = ?, progress_message_id = ? WHERE run_id = ?
+            """, (seq, time(), message_id, run_id))
 
     def owns_run(self, app_id: str, sender: str, run_id: str) -> bool:
         with self.store.connect() as db:
@@ -214,7 +239,7 @@ class FeishuService:
             status = "error" if error else "connected" if self._connected else "connecting"
         return {"enabled": config.enabled, "app_id": config.app_id,
                 "has_app_secret": bool(config.app_secret), "allowed_open_ids": config.allowed_open_ids,
-                "approval_mode": config.approval_mode, "approval_buttons": config.approval_buttons,
+                "approval_mode": "auto", "approval_buttons": True,
                 "status": status, "error": error}
 
     async def save(self, config: FeishuSettings, *, expected: FeishuSettings | None = None):
@@ -265,21 +290,18 @@ class FeishuService:
 
         def on_action(sender, value):
             run_id, call_id, approved = (value.get(key) for key in ("run_id", "call_id", "approved"))
-            scope = value.get("scope", "once")
             if (
                 self.config is not config or not isinstance(sender, str) or sender not in allowed
                 or not isinstance(run_id, str) or not isinstance(call_id, str) or type(approved) is not bool
-                or scope not in ("once", "session") or (scope == "session" and not approved)
+                or value.get("scope", "once") != "once"
                 or not self.inbox.owns_run(config.app_id, sender, run_id)
             ):
                 return {"toast": {"type": "error", "content": "你无权审批此任务。"}}
             try:
-                self.decide(run_id, call_id, approved, scope=scope)
+                self.decide(run_id, call_id, approved)
             except (NotFound, Conflict):
                 return {"toast": {"type": "info", "content": "此审批已处理或已失效。"}}
             message = "已同意执行" if approved else "已拒绝执行"
-            if scope == "session":
-                message = "已允许本会话后续操作"
             return {"toast": {"type": "success", "content": message},
                     "card": {"type": "raw", "data": markdown_card(message)}}
 
@@ -290,13 +312,8 @@ class FeishuService:
 
         async def receive(message_id: str, sender: str, text: str):
             if self.config is config and sender in allowed and message_id and (task := text.strip()):
-                if task.lower() == "/approval manual":
-                    session_id = self.inbox.session_for(config.app_id, sender)
-                    if session_id:
-                        self.store.revoke_feishu_session_approval(session_id)
-                    message = ("当前渠道设置为完全允许。请在 Mini Harness 的飞书 IM 设置中切回逐次审批。"
-                               if config.approval_mode == "allow" else "本会话的新任务将恢复逐次审批。")
-                    acknowledge(message_id, {"toast": {"content": message}})
+                if re.fullmatch(r"/(?:approval\s+manual|approve-session(?:\s+.*)?)", task, flags=re.IGNORECASE):
+                    acknowledge(message_id, {"toast": {"content": "飞书使用自动审批，高风险操作需要逐次确认。"}})
                     return
                 if command := APPROVAL_COMMAND.fullmatch(task):
                     pending = self.inbox.waiting_approval(config.app_id, sender)
@@ -304,10 +321,8 @@ class FeishuService:
                     if pending:
                         call_id = json.loads(pending["approval"])["call_id"]
                         if approval_code(pending["id"], call_id) == command[2].lower():
-                            action = command[1].lower()
                             value = {"run_id": pending["id"], "call_id": call_id,
-                                     "approved": action != "deny",
-                                     "scope": "session" if action == "approve-session" else "once"}
+                                     "approved": command[1].lower() == "approve"}
                     outcome = on_action(sender, value) if value else {
                         "toast": {"content": "此审批已处理或已失效。"}}
                     acknowledge(message_id, outcome)
@@ -408,73 +423,68 @@ class FeishuService:
                 # The inbox assigns the Run ID before submission so a restart can recover
                 # an accepted Run without starting another for the same Feishu message.
                 session_id = self.inbox.session_for(item["app_id"], item["sender"])
-                mode = self.config.approval_mode
-                if session_id and self.store.feishu_session_allowed(session_id):
-                    mode = "allow"
-                self.start_run(item["task"], session_id, run_id, mode)
+                self.start_run(item["task"], session_id, run_id)
             except Conflict:
-                # The same session can also be used from the Web UI.
+                # A prior run in this session may still be active.
                 pass
             return
 
         status = run["status"]
-        if status == "awaiting_approval" and self.config.approval_mode == "allow":
-            try:
-                self.decide(run_id, run["approval"]["call_id"], True, scope="channel")
-            except Conflict:
-                pass
-            return
-        if status in {"running", "awaiting_approval", "completed", "failed", "cancelled"}:
-            await self._progress(item, transport, flush=status != "running")
+        terminal = status in {"completed", "failed", "cancelled"}
+        if terminal or status in {"running", "awaiting_approval", "paused"}:
+            await self._progress(item, transport, status, flush=terminal)
         if status == "awaiting_approval":
-            style = "buttons" if self.config.approval_buttons else "commands"
-            await self._reply(item, transport, f"approval-{style}:{run['approval']['call_id']}",
-                              "任务正在等待审批。", cards=approval_cards(run, with_buttons=self.config.approval_buttons))
+            await self._reply(item, transport, f"approval-once:{run['approval']['call_id']}",
+                              "任务正在等待审批。", cards=approval_cards(run))
         elif status == "paused":
             await self._reply(item, transport, f"paused:{run['updated_at']}",
                               "任务已暂停。请在 Mini Harness 网页打开对应会话，恢复或取消任务。")
-        elif status in {"completed", "failed", "cancelled"}:
+        elif terminal:
             if item["reaction_id"] is None:
                 return
             text = {"completed": run["output"] or "任务已完成。", "failed": "任务失败，详情可在 Mini Harness 网页查看。",
                     "cancelled": "任务已取消。"}[status]
             await self._reply(item, transport, status, text, finished=True, markdown=status == "completed")
 
-    async def _progress(self, item: dict, transport, *, flush: bool):
-        if not flush and time() - item["progress_at"] < 8:
+    async def _progress(self, item: dict, transport, status: str, *, flush: bool):
+        message_id = item["progress_message_id"]
+        if message_id == "" or (not flush and time() - item["progress_at"] < PROGRESS_INTERVAL):
             return
-        events = self.store.events(item["run_id"], after=item["progress_seq"], include_deltas=False)
-        starts = [event["data"] for event in events if event["type"] == "tool_call"]
-        results = [event["data"]["result"] for event in events if event["type"] == "tool_result"]
-        narration = [event["data"]["message"].get("content") for event in events
-                     if event["type"] == "assistant" and event["data"].get("calls")]
-        narration = [note.strip() for note in narration if isinstance(note, str) and note.strip()]
-        if starts or results or narration:
-            failed = sum(bool(result.get("error") or result.get("exit_code", 0)) for result in results)
-            lines = ["**任务进度**"]
-            if starts:
-                labels = []
-                for operation in starts[-5:]:
-                    if operation.get("tool") == "computer_use":
-                        labels.append(COMPUTER_ACTIONS.get(operation["arguments"].get("action"), "操作界面"))
-                    else:
-                        labels.append("执行终端操作")
-                if len(starts) > len(labels):
-                    labels.insert(0, f"此前还有 {len(starts) - len(labels)} 项操作")
-                lines.append("- 开始：" + "、".join(labels))
-            if results:
-                lines.append(f"- {len(results)} 个工具操作已结束" + (f"，其中 {failed} 个未成功" if failed else ""))
-            if narration:
-                lines.extend(("", narration[-1][:1000]))
-            seq = events[-1]["seq"]
-            text = "\n".join(lines)
+        run_id = item["run_id"]
+        events = self.inbox.progress_events(run_id, item["progress_seq"])
+        if not events:
+            return
+        # A status transition may have landed after _process read the run.
+        status = next((event["data"]["status"] for event in reversed(events) if event["type"] == "status"), status)
+        card = progress_card(events, status)
+        if card is None:
+            return
+        seq = events[-1]["seq"]
+        if message_id is None:
+            # A lost reply response leaves the card ID unknown. Reserve the single
+            # send before calling Feishu so a restart cannot create another card.
+            self.inbox.progress_saved(run_id, seq, "")
             try:
-                await transport.reply(item["message_id"], text,
-                                      uuid5(NAMESPACE_URL, f"mini-harness/feishu/{item['run_id']}/progress/{seq}").hex,
-                                      card=markdown_card(text))
-            except FeishuTransportError:
-                logger.warning("Could not send Feishu tool progress")
-            self.inbox.progress_saved(item["run_id"], seq)
+                message_id = await transport.reply(
+                    item["message_id"], "", uuid5(NAMESPACE_URL, f"mini-harness/feishu/{run_id}/progress-card").hex,
+                    card=card,
+                )
+            except FeishuTransportError as error:
+                logger.warning("Could not send Feishu tool progress (%s)", error.code)
+                return
+            if message_id:
+                self.inbox.progress_saved(run_id, seq, message_id)
+            return
+
+        try:
+            await transport.update_card(message_id, card)
+        except FeishuCardUnavailable:
+            message_id = ""
+        except FeishuTransportError as error:
+            logger.warning("Could not update Feishu tool progress (%s)", error.code)
+            if not flush:
+                seq = item["progress_seq"]
+        self.inbox.progress_saved(run_id, seq, message_id)
 
     async def _reply(self, item: dict, transport, key: str, text: str, *, finished: bool = False,
                      markdown: bool = False, cards: list[dict] | None = None):

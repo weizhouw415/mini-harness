@@ -188,7 +188,7 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(reason, str)
                     self.assertTrue(reason.strip())
 
-    async def test_auto_checks_each_cloud_tool_call(self):
+    async def test_auto_approves_routine_browser_and_shell_operations(self):
         await self.check_approvals([
             ("computer_use", {"action": "observe"}),
             ("computer_use", {"action": "scroll", "direction": "down", "amount": 420}),
@@ -198,9 +198,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
             ("computer_use", {"action": "click", "x": 8, "y": 7}),
             ("computer_use", {"action": "upload", "selector": "input[type=file]", "path": "report.txt"}),
             ("computer_use", {"action": "screenshot"}),
-        ], pauses=(3, 4, 5, 6), automatic=(0, 1, 2, 7))
+        ], pauses=(), automatic=range(8))
 
-    async def test_auto_desktop_observation_also_works_on_default_worker(self):
+    async def test_auto_desktop_operations_require_approval_for_bulk_deletion(self):
         steps = [
             ("computer_use", {"action": "screenshot"}),
             ("computer_use", {"action": "observe"}),
@@ -212,21 +212,21 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         ]
         for explicit_worker in (False, True):
             with self.subTest(explicit_worker=explicit_worker):
-                await self.check_approvals(steps, (2, 3, 6), environment="macos-desktop",
-                                           explicit_worker=explicit_worker, automatic=(0, 1, 4, 5), trust_bash=True)
+                await self.check_approvals(steps, (6,), environment="macos-desktop",
+                                           explicit_worker=explicit_worker, automatic=range(6), trust_bash=True)
 
-    async def test_old_worker_does_not_auto_approve_external_view_commands(self):
+    async def test_older_worker_uses_same_approval_policy(self):
         await self.check_approvals([
             ("bash", {"command": "pwd"}),
             ("bash", {"command": "ls -la ~/Documents/"}),
             ("bash", {"command": "cat README.md"}),
-        ], pauses=(1, 2), environment="macos-desktop", safe_bash_path=False, automatic=(0,))
+        ], pauses=(), environment="macos-desktop", safe_bash_path=False, automatic=range(3))
 
     async def test_desktop_worker_targets_the_current_desktop(self):
         await self.check_approvals([
             ("computer_use", {"action": "observe"}),
             ("computer_use", {"action": "click", "x": 8, "y": 7}),
-        ], pauses=(1,), automatic=(0,), environment="macos-desktop",
+        ], pauses=(), automatic=range(2), environment="macos-desktop",
             computer_targets={"desktop": ["click", "observe"]}, routed_targets=["desktop", "desktop"])
 
     def test_desktop_worker_does_not_accept_browser_actions(self):
@@ -234,13 +234,13 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "does not support computer target: browser"):
             Agent._route_computer({"action": "click", "target": "browser", "x": 8, "y": 7}, capabilities)
 
-    async def test_directional_scroll_only_auto_approves_short_browser_scrolls_without_coordinates(self):
+    async def test_browser_scroll_and_drag_auto_approve(self):
         await self.check_approvals([
             ("computer_use", {"action": "scroll", "direction": "up", "amount": 420}),
             ("computer_use", {"action": "scroll", "direction": "right", "amount": 4_001}),
             ("computer_use", {"action": "scroll", "direction": "down", "amount": 20, "x": 8, "y": 7}),
             ("computer_use", {"action": "drag", "x": 8, "y": 7, "end_x": 16, "end_y": 14}),
-        ], pauses=(1, 2, 3), automatic=(0,))
+        ], pauses=(), automatic=range(4))
 
     def test_tool_arguments_validate_gesture_fields_and_keep_the_reviewed_timeout(self):
         agent = Agent(Settings(), None, None, None)
@@ -272,8 +272,9 @@ class BashApprovalTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(mode=mode):
                 await self.check_approvals(steps, pauses, mode=mode, trust_bash=trust_bash, automatic=automatic)
 
-    async def test_trusted_cloud_bash_does_not_authorize_cli_mouse_input(self):
+    async def test_cloud_bash_trust_does_not_bypass_high_risk_auto_approval(self):
         await self.check_approvals([
             ("bash", {"command": "printf done > report.txt"}),
             ("computer_use", {"action": "click", "x": 8, "y": 7}),
-        ], pauses=(1,), automatic=(0,), trust_bash=True)
+            ("bash", {"command": "sudo /bin/rm -f -R -- project-directory"}),
+        ], pauses=(2,), automatic=(0, 1), trust_bash=True)

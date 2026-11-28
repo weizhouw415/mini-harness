@@ -27,7 +27,7 @@ const idPattern = /^[a-f0-9]{32}$/;
 const workerNames = { desktop: "桌面", browser: "云端浏览器" };
 const approvalHints = {
   manual: "每次工具调用都等你确认",
-  auto: "低风险操作自动通过，其他操作需确认",
+  auto: "日常操作自动通过，rm -rf 等高风险命令需确认",
   allow: "所有工具调用都直接执行",
 };
 const attachmentLimits = { count: 8, file: 20 * 1024 ** 2, total: 40 * 1024 ** 2 };
@@ -44,6 +44,7 @@ let draftSequence = 0;
 let newDraft = createDraft();
 let conversation = newDraft;
 let recentSessions = [];
+let feishuSessions = [];
 let run = null;
 const approvalUpdates = new Map();
 const actions = new Map();
@@ -214,7 +215,8 @@ function setText(node, content) {
 function updateSendControl() {
   const pending = Boolean(pendingSubmission());
   const button = $("send");
-  button.disabled = !($("task").value.trim() || conversation.files.length) || !workerAvailable() || pending ||
+  button.disabled = conversation.channel === "feishu" ||
+    !($("task").value.trim() || conversation.files.length) || !workerAvailable() || pending ||
     (!conversation.key.startsWith("draft/") && !run) || active.has(run?.status) || Boolean(pendingAction());
   button.setAttribute("aria-busy", String(pending));
   button.setAttribute("aria-label", pending ? "正在发送" : "发送消息");
@@ -226,12 +228,14 @@ function showRunControls() {
   const currentAction = pendingAction();
   const changingApprovalMode = pendingApprovalMode();
   const hasConversation = !conversation.key.startsWith("draft/") || Boolean(pending);
+  const isFeishu = conversation.channel === "feishu";
+  $("composer").hidden = isFeishu;
   $("empty").hidden = hasConversation;
   $("conversation-loading").hidden = !conversationLoading;
   $("run").hidden = !turns.size && !pending;
   const first = $("turns").firstElementChild;
-  setText($("title"), first?.querySelector(".task")?.textContent.split("\n")[0]
-    || (hasConversation ? "对话" : "新对话"));
+  const title = first?.querySelector(".task")?.textContent.split("\n")[0] || (hasConversation ? "对话" : "新对话");
+  setText($("title"), isFeishu ? "飞书 · " + title : title);
 
   const status = $("status");
   const [state, label] = actionLabels[currentAction] || (pending ? ["submitting", "正在发送"] :
@@ -279,6 +283,7 @@ function select(hash, initial = null) {
     draftConversations.get(hash) || newDraft;
   conversation.task = $("task").value;
   conversation = next;
+  if (conversation.channel === "feishu") $("feishu-history-group").open = true;
   revision++;
   $("task").value = conversation.task;
   attachmentError();
@@ -312,19 +317,20 @@ function select(hash, initial = null) {
 }
 
 function showHistory() {
-  const sessionHistory = [...startedSessions.values(), ...recentSessions].map((item) => {
+  const sessionItem = (item) => {
     const key = "session/" + item.id;
     const status = conversations.get(key)?.submission ? "submitting" : item.status;
     return { key, title: item.title, status };
-  });
+  };
   const draftHistory = [...draftConversations.values()].reverse().map((item) => ({
     key: item.key, title: item.title, status: item.submission ? "submitting" : "send_failed",
   }));
-  const items = [...draftHistory, ...sessionHistory];
-  const key = JSON.stringify(items);
+  const webItems = [...draftHistory, ...[...startedSessions.values(), ...recentSessions].map(sessionItem)];
+  const feishuItems = feishuSessions.map(sessionItem);
+  const key = JSON.stringify([webItems, feishuItems]);
   if (historyKey === key) return;
   historyKey = key;
-  const nodes = items.map((item) => {
+  const historyButton = (item) => {
     const button = element("button");
     button.type = "button";
     button.title = item.title + " · " + names[item.status];
@@ -340,8 +346,10 @@ function showHistory() {
       if (wasOpen) $("scroll").focus({ preventScroll: true });
     });
     return button;
-  });
-  $("history").replaceChildren(...(nodes.length ? nodes : [element("p", "暂无对话")]));
+  };
+  for (const [id, items] of [["web-history", webItems], ["feishu-history", feishuItems]]) {
+    $(id).replaceChildren(...(items.length ? items.map(historyButton) : [element("p", "暂无对话")]));
+  }
 }
 
 function showWorkers(workers) {
@@ -1204,6 +1212,11 @@ function showApprovalMode() {
 }
 
 function showTurns(values) {
+  const channel = values[0]?.channel;
+  if (channel && conversation.channel !== channel) {
+    conversation.channel = channel;
+    if (channel === "feishu") $("feishu-history-group").open = true;
+  }
   const pending = pendingSubmission();
   if (pending) values = values.slice(0, values.findIndex((value) => value.id === pending.previousRunId) + 1);
   preserveScroll(() => {
@@ -1228,15 +1241,18 @@ async function refreshOverview() {
   if (overviewPolling) return;
   overviewPolling = true;
   try {
-    const [recent, workers] = await Promise.allSettled([api("/v1/sessions"), api("/v1/workers")]);
+    const [recent, feishu, workers] = await Promise.allSettled([
+      api("/v1/sessions?channel=web"), api("/v1/sessions?channel=feishu"), api("/v1/workers"),
+    ]);
     if (workers.status === "fulfilled") showWorkers(workers.value);
     else connection(null);
     if (recent.status === "fulfilled") {
       recentSessions = recent.value;
       for (const item of recentSessions) startedSessions.delete(item.id);
-      showHistory();
     }
-    const failure = [recent, workers].find((result) => result.status === "rejected");
+    if (feishu.status === "fulfilled") feishuSessions = feishu.value;
+    showHistory();
+    const failure = [recent, feishu, workers].find((result) => result.status === "rejected");
     refreshNotice(failure?.reason.message || "", "overview");
   } finally {
     overviewPolling = false;
@@ -1486,7 +1502,12 @@ function updateFeishuSecretHint() {
 
 function showFeishuStatus(data) {
   const badge = $("feishu-status");
-  const label = { disabled: "已停用", connecting: "连接中", connected: "已连接", error: "异常" }[data.status] || "状态未知";
+  const label = {
+    disabled: data.app_id ? "已停用" : "未连接",
+    connecting: "连接中",
+    connected: "已连接",
+    error: "连接异常",
+  }[data.status] || "状态未知";
   if (badge.textContent !== label) badge.textContent = label;
   badge.dataset.state = data.status;
   badge.hidden = false;
@@ -1503,8 +1524,7 @@ function showFeishuSettings(data) {
   $("feishu-app-secret").value = "";
   $("feishu-clear-secret").checked = false;
   $("feishu-open-ids").value = data.allowed_open_ids.join("\n");
-  $("feishu-approval-mode").value = data.approval_mode || "manual";
-  $("feishu-approval-buttons").checked = Boolean(data.approval_buttons);
+  $("feishu-scan-start").textContent = data.app_id ? "更换机器人" : "生成二维码";
   updateFeishuSecretHint();
   showFeishuStatus(data);
   if (!feishuRegistrationId && !feishuScanPending) $("feishu-scan-start").disabled = false;
@@ -1522,8 +1542,9 @@ function showFeishuScan(data) {
     completed: "已保存机器人。请在飞书打开机器人，发送一条单聊消息。",
     cancelled: "已取消扫码配置。",
   };
-  status.textContent = data.error || message[data.status] || "";
-  status.hidden = !status.textContent;
+  setText(status, data.error || message[data.status] || "");
+  status.classList.toggle("feishu-scan-error", Boolean(data.error));
+  $("feishu-scan-result").hidden = !status.textContent && !data.qr_png;
   if (data.qr_png && code.dataset.registration !== data.id) {
     if (code.src) URL.revokeObjectURL(code.src);
     const bytes = Uint8Array.from(atob(data.qr_png), (byte) => byte.charCodeAt(0));
@@ -1538,6 +1559,7 @@ function showFeishuScan(data) {
   }
   code.hidden = link.hidden = !data.qr_png;
   $("feishu-scan-start").disabled = active || !settingsLoaded.feishu;
+  $("feishu-scan-start").hidden = active;
   $("feishu-scan-cancel").hidden = !active || data.status === "saving";
   if (!active) {
     feishuRegistrationId = null;
@@ -1746,8 +1768,6 @@ $("feishu-settings-form").addEventListener("submit", (event) => {
     app_id: appId,
     app_secret: appSecret || (clearSecret ? "" : null),
     allowed_open_ids: openIds,
-    approval_mode: $("feishu-approval-mode").value,
-    approval_buttons: $("feishu-approval-buttons").checked,
   });
 });
 $("model-form").addEventListener("submit", async (event) => {

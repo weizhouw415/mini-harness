@@ -119,10 +119,25 @@ button:disabled { opacity: .56; cursor: default; }
   display: grid;
   align-content: start;
   gap: 3px;
+  margin-top: 16px;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
+}
+
+.channel-history {
+  display: grid;
+  gap: 3px;
+}
+
+#feishu-history-label {
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+#history-label {
+  margin-top: 12px;
 }
 
 #history button {
